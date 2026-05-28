@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/workspace/Mahjong/mjx/external/boost-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

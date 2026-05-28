@@ -1,0 +1,7 @@
+protobuf==3.20.2
+google
+grpcio
+numpy
+pillow
+svgwrite
+inquirer

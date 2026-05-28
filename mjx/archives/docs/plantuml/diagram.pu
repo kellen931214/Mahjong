@@ -1,0 +1,233 @@
+@startuml
+
+top to bottom direction
+
+set namespaceSeparator ::
+
+class mj::env::Environment {
+    - agents: Agent
+    - state: State
+    + Run(): void
+    + RunOneGame(): void
+    + RunOneRound(): void
+}
+
+class mj::env::State {
+    - mj::State
+    + CreateObservation(): pair<AbsolutePos, Observation>
+    + UpdateState(Action): void
+    + IsRoundOver(): bool
+    + IsGameOver(): bool
+    + Next(): State
+}
+
+class mj::env::Observation <<(D,yellow) Data>> {
+    - observation mjproto::Observation
+}
+
+class mj::env::Action <<(D,yellow) Data>> {
+    - action_response mjproto::Action
+}
+
+abstract class mj::env::Agent {
+    - mj::agent::Agent
+    + TakeAction(): Action
+}
+
+abstract class mj::agent::Agent {
+    + TakeAction(): Action
+}
+
+class mj::agent::AgentExampleRuleBased {
+    + TakeAction(): Action
+}
+
+class mj::agent::AgentGrpcClient {
+    + TakeAction(): Action
+}
+
+class mj::agent::AgentGrpcServer {
+    + RunServer(): void
+}
+
+class mj::agent::AgentGrpcServerImplRuleBased{
+
+}
+
+class mj::mahjong::State {
+    - score: Score
+    - stage: RoundStage
+    - dealer: AbsolutePos
+    - drawer: AbsolutePos
+    - wall: Wall
+    - players: array<Player, 4>
+    - event_history: mjproto::EventHistory
+    - private_infos: vector<mjproto::InitHand>
+    + InitRound(): void
+    + CreateObservation(): pair<AbsolutePos, Observation>
+    + UpdateState(Action): void
+    + IsRoundOver(): bool
+    - PossibleActions(): vector<Action>
+    - UpdateStateByDraw(): mj::Tile
+    - UpdateStateByAction(): void
+    - UpdateStateByActionCandidates(): void
+}
+
+class mj::mahjong::YakuEvaluator <<(S,orange) Static>> {
+    + {static} Has(): bool
+    + {static} Eval(): mj::WinScore
+}
+
+class mj::mahjong::WinHandCache <<(S,orchid) Singleton>> {
+    - win_cache
+    - tenpai_cache
+    + Has(): bool
+}
+
+class mj::mahjong::WinStateInfo <<(D,yellow) Data>> {
+    + seat_wind
+    + prevalent_wind
+    + is_bottom
+    + is_ippatsu
+    + is_double_riichi
+    + is_first_tsumo
+    + is_dealer
+    + dora
+    + reversed_dora
+}
+
+class mj::mahjong::WinInfo <<(D,yellow) Data>> {
+    + win_state_info
+    + win_hand_info
+    + Ron(): WinInfo&
+}
+
+class mj::mahjong::WinScore <<(D,yellow) Data>> {
+    + yakuman: map<mj::Yaku, int>
+    + yaku: map<mj::Yaku, bool>
+    + fu: optional<int>
+}
+
+class mj::mahjong::WinHandInfo <<(D,yellow) Data>> {
+    + opens: vector<Open>
+    + closed_tiles: unordered_set<mj::Tile, HashTile> 
+    + last_tile_added: std::optional<Tile> 
+    + stage: HandStage 
+    + under_riichi bool 
+    + closed_tile_types: TileTypeCount 
+    + all_tile_types: TileTypeCount 
+    + is_menzen: bool
+}
+
+class mj::mahjong::Wall {
+    - tiles: vector<Tile>
+    + <<get>> initial_hands(): array<Hand, 4>
+    + <<get>> doras(): vector<Tile>
+    + <<get>> ura_doras(): vector<Tile>
+    + Draw(): Tile
+    + KanDraw(): Tile
+    + AddKanDora()
+    + HasDrawLeft(): bool
+}
+
+class mj::mahjong::Hand {
+    - stage
+    - last_tile_added
+    - closed_tiles
+    - opens
+    - undiscardable_tiles
+    - under_riichi
+    + PossibleDiscards()
+    + PossibleDiscardsAfterRiichi()
+    + PossibleOpensAfterOthersDiscard()
+    + PossibleOpensAfterDraw()
+    + CanRon()
+    + IsCompleted()
+    + CanRiichi()
+    + Draw()
+    + Riichi()
+    + ApplyOpen()
+    + Ron()
+    + RonAfterOthersKan()
+    + Tsumo()
+    + Discard()
+
+}
+
+class mj::mahjong::Open {
+    - bits: int
+    + <<get>> type()
+    + <<get>> from()
+    + <<get>> at()
+    + <<get>> size()
+    + <<get>> tiles()
+    + <<get>> tiles_from_hand()
+    + <<get>> stolen_tile()
+    + <<get>> last_tile()
+    + <<get>> undiscardable_tile_types()
+    + <<get>> bits()
+}
+
+class mj::mahjong::Chi <<(S,orange) Static>> {
+    + Create(): Open
+}
+
+class mj::mahjong::Pon <<(S,orange) Static>> {
+    + Create(): Open
+}
+
+class mj::mahjong::KanOpened <<(S,orange) Static>> {
+    + Create(): Open
+}
+
+class mj::mahjong::KanClosed <<(S,orange) Static>> {
+    + Create(): Open
+}
+
+class mj::mahjong::KanAdded <<(S,orange) Static>> {
+    + Create(): Open
+}
+
+class mj::mahjong::Tile {
+    + id
+    + type
+}
+
+mj::env::Environment "1" *-- "4" mj::env::Agent
+mj::env::Environment *-- mj::env::State 
+mj::env::State <-- mj::env::Action : UpdateStateByAction
+mj::env::State --> mj::env::Observation
+mj::env::Observation --> mj::env::Agent : TakeAction
+mj::env::Agent --> mj::env::Action : TakeAction
+
+mj::agent::Agent <|-- mj::agent::AgentExampleRuleBased
+mj::agent::Agent <|-- mj::agent::AgentGrpcClient
+mj::agent::AgentGrpcClient --> mj::agent::AgentGrpcServer : <<mjproto::Observation>>
+mj::agent::AgentGrpcServer --> mj::agent::AgentGrpcClient : <<mjproto::Action>>
+mj::agent::AgentGrpcServer *-- mj::agent::AgentGrpcServerImplRuleBased
+
+mj::mahjong::State *-- mj::mahjong::Wall
+mj::mahjong::State "1" *-- "4" mj::mahjong::Hand
+mj::mahjong::State --> mj::mahjong::WinStateInfo
+
+
+mj::mahjong::Hand "0" *-- "1..4" mj::mahjong::Open
+mj::mahjong::Hand -- mj::mahjong::WinHandCache 
+mj::mahjong::Hand --> mj::mahjong::WinHandInfo
+
+mj::mahjong::Open <-- mj::mahjong::Chi : Create
+mj::mahjong::Open <-- mj::mahjong::Pon : Create
+mj::mahjong::Open <-- mj::mahjong::KanClosed : Create
+mj::mahjong::Open <-- mj::mahjong::KanOpened : Create
+mj::mahjong::Open <-- mj::mahjong::KanAdded : Create
+
+mj::mahjong::WinHandInfo --> mj::mahjong::WinInfo
+mj::mahjong::WinStateInfo --> mj::mahjong::WinInfo
+mj::mahjong::WinInfo --> mj::mahjong::YakuEvaluator : Has, Eval
+mj::mahjong::WinScore --> mj::mahjong::State
+
+mj::mahjong::YakuEvaluator -- mj::mahjong::WinHandCache
+mj::mahjong::YakuEvaluator --> mj::mahjong::WinScore : Eval
+
+
+@enduml

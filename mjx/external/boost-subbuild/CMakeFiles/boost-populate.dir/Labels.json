@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate-complete.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-build.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-configure.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-download.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-install.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-mkdir.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-patch_disconnected.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-test.rule"
+		},
+		{
+			"file" : "/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-update_disconnected.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"boost-populate"
+		],
+		"name" : "boost-populate"
+	}
+}

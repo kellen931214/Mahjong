@@ -1,0 +1,23 @@
+name: ci
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Cache external
+      uses: actions/cache@v2
+      with:
+        path: |
+          external
+        key: external-${{ hashFiles('include/mjx/cmake/*') }}-v1
+
+    - name: Build mjx
+      run: mkdir -p build && cd build && cmake .. -DMJX_BUILD_BOOST=ON -DMJX_BUILD_GRPC=ON -DMJX_BUILD_TESTS=ON && make -j 4
+
+    - name: Test mjx
+      run: ./build/tests_cpp/mjx_tests_cpp
+

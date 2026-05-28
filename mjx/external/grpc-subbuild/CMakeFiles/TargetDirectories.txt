@@ -1,0 +1,3 @@
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/grpc-populate.dir
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/edit_cache.dir
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/rebuild_cache.dir

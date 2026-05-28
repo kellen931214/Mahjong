@@ -1,0 +1,14 @@
+# Target labels
+ boost-populate
+# Source files and their labels
+/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate
+/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/CMakeFiles/boost-populate-complete.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-build.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-configure.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-download.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-install.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-mkdir.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-patch_disconnected.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-test.rule
+/workspace/Mahjong/mjx/external/boost-subbuild/boost-populate-prefix/src/boost-populate-stamp/boost-populate-update_disconnected.rule

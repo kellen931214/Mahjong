@@ -1,0 +1,14 @@
+# Target labels
+ grpc-populate
+# Source files and their labels
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/grpc-populate
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/grpc-populate.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/CMakeFiles/grpc-populate-complete.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-build.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-configure.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-download.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-install.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-mkdir.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-patch_disconnected.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-test.rule
+/workspace/Mahjong/mjx/external/grpc-subbuild/grpc-populate-prefix/src/grpc-populate-stamp/grpc-populate-update_disconnected.rule

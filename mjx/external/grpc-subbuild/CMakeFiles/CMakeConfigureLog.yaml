@@ -1,0 +1,79 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/tmp/pip-build-env-wj5jz12_/overlay/lib/python3.9/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/tmp/pip-build-env-wj5jz12_/overlay/bin/"
+      - "/tmp/pip-build-env-wj5jz12_/normal/bin/"
+      - "/root/miniconda3/envs/mahjong_39/bin/"
+      - "/root/miniconda3/condabin/"
+      - "/usr/local/cuda/bin/"
+      - "/root/.vscode-server/cli/servers/Stable-f6cfa2ea2403534de03f069bdf160d06451ed282/server/bin/remote-cli/"
+      - "/root/.local/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/sbin/"
+      - "/usr/bin/"
+      - "/sbin/"
+      - "/bin/"
+      - "/usr/games/"
+      - "/usr/local/games/"
+      - "/snap/bin/"
+      - "/root/.vscode-server/extensions/ms-python.debugpy-2026.6.0-linux-x64/bundled/scripts/noConfigScripts/"
+    searched_directories:
+      - "/tmp/pip-build-env-wj5jz12_/overlay/bin/uname"
+      - "/tmp/pip-build-env-wj5jz12_/normal/bin/uname"
+      - "/root/miniconda3/envs/mahjong_39/bin/uname"
+      - "/root/miniconda3/condabin/uname"
+      - "/usr/local/cuda/bin/uname"
+      - "/root/.vscode-server/cli/servers/Stable-f6cfa2ea2403534de03f069bdf160d06451ed282/server/bin/remote-cli/uname"
+      - "/root/.local/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+      - "/usr/sbin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/tmp/pip-build-env-wj5jz12_/overlay/bin"
+        - "/tmp/pip-build-env-wj5jz12_/normal/bin"
+        - "/root/miniconda3/envs/mahjong_39/bin"
+        - "/root/miniconda3/condabin"
+        - "/usr/local/cuda/bin"
+        - "/root/.vscode-server/cli/servers/Stable-f6cfa2ea2403534de03f069bdf160d06451ed282/server/bin/remote-cli"
+        - "/usr/local/cuda/bin"
+        - "/root/.local/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/sbin"
+        - "/usr/bin"
+        - "/sbin"
+        - "/bin"
+        - "/usr/games"
+        - "/usr/local/games"
+        - "/snap/bin"
+        - "/root/.vscode-server/extensions/ms-python.debugpy-2026.6.0-linux-x64/bundled/scripts/noConfigScripts"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/tmp/pip-build-env-wj5jz12_/overlay/lib/python3.9/site-packages/cmake/data/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 6.19.14-104.fc42.x86_64 - x86_64
+...
