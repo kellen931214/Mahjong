@@ -207,6 +207,7 @@ class SelfPlayRunner:
                 real_tens = [25000, 25000, 25000, 25000]
         except Exception:
             real_tens = [25000, 25000, 25000, 25000]
+            final_state_proto = None
         
         if agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
             final_obs = None
@@ -258,7 +259,8 @@ class SelfPlayRunner:
         #    mjx 在 round over 時 legal_actions 只回傳 DUMMY (action=99)，
         #    TSUMO(5)/RON(10) 不會出現在 action-level，因此必須從 proto wins 讀取。
         wins_pids = []
-        if (final_state_proto.HasField("round_terminal") and
+        if (final_state_proto is not None and
+            final_state_proto.HasField("round_terminal") and
             len(final_state_proto.round_terminal.wins) > 0):
             wins_pids = [w.who for w in final_state_proto.round_terminal.wins]
         is_agari = agent_has_won or (agent_pid in wins_pids)

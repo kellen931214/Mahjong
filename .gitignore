@@ -37,3 +37,5 @@ workspace/suphx-reward-shaping/check/*
 converted_features_npy/
 train_bc.log
 miniconda.sh
+train_ppo_v4.log
+train_ppo.log
