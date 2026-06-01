@@ -36,16 +36,19 @@ class MahjongRewardCalculator:
         base_exp_score: float = 2000.0,
         score_norm_factor: float = 10000.0,
         penalty_weight: float = 2.0,
+        potential_weight: float = 0.3,
     ):
         """
         Args:
             base_exp_score: 預設期望打點（用於 r_potential 的基準分）
             score_norm_factor: 正規化因子，避免 PPO 梯度爆炸
             penalty_weight: 放銃懲罰倍率（方案四：預設 2.0，加重防守意識）
+            potential_weight: r_potential 權重（v5: 0.3，降低沿途雞牌雜音）
         """
         self.base_exp_score = base_exp_score
         self.score_norm_factor = score_norm_factor
         self.penalty_weight = penalty_weight
+        self.potential_weight = potential_weight
 
     # ==================== 共用輔助方法 ====================
 
@@ -160,16 +163,16 @@ class MahjongRewardCalculator:
 
     def calculate_dora_potential_reward(self, obs: mjx.Observation) -> float:
         """
-        r_dora = dora_count × 0.5 / norm_factor
+        r_dora = dora_count × 0.05 / 1000
 
         即時獎勵，鼓勵模型保留寶牌以追求高價值牌型。
-        每多一張寶牌，獎勵增加 0.5/1000。
+        每多一張寶牌，獎勵增加 0.05/1000。
         
         Returns:
             正規化後的寶牌潛力獎勵
         """
         dora_count = self.count_dora_in_hand(obs)
-        return dora_count * 0.5 / self.score_norm_factor
+        return dora_count * 0.05 / 1000.0
 
     # ==================== 1. r_potential — 進攻潛力 ====================
 
@@ -205,7 +208,7 @@ class MahjongRewardCalculator:
             return self.base_exp_score / self.score_norm_factor
 
         potential = self.base_exp_score * ukeire / (shanten + 1.0)
-        return potential / self.score_norm_factor
+        return potential / self.score_norm_factor * self.potential_weight
 
     # ==================== 2. r_backward — Han Backward ====================
 
@@ -244,9 +247,9 @@ class MahjongRewardCalculator:
         對齊 Readme.md Eq.12。
         將最終得分按牌型比例均分，回饋給每一步中與最終牌型重合的牌。
 
-        🆕 方案四：非線性獎勵 — 使用 score² 放大高分牌的 reward
-            unit_score = final_score² / (total_tiles × score_norm_factor)
-            效果：45分→2.0, 90分→8.1（4倍差距，鼓勵做大牌）
+         🆕 v5：Score² 非線性獎勵
+             unit_score = final_score² / (total_tiles × score_norm_factor)
+             效果：30分→0.09, 90分→0.81（9倍差距，鼓勵做大牌和牌）
 
         Args:
             final_hand_34: 最終和牌型的 34 維張數分佈
@@ -257,10 +260,9 @@ class MahjongRewardCalculator:
         if total_tiles == 0:
             return 0.0
 
-        # 🆕 方案四：非線性單位得分（score^1.5），放大大牌價值但避免 Value Loss 爆炸
-        # score² 會讓 reward 範圍 2~130（對 45~360 分），Critic 無法收斂
-        # score^1.5 將範圍控制在 0.3~7，仍保持大牌 > 小牌的非線性
-        unit_score = (final_score * np.sqrt(final_score)) / (total_tiles * self.score_norm_factor)
+        # 🆕 v5：Score² 非線性獎勵，大幅放大高分牌的回饋
+        # 30分→0.09, 90分→0.81（9倍差距），鼓勵模型追求大牌和牌
+        unit_score = (final_score * final_score) / (total_tiles * self.score_norm_factor)
 
         overlap = np.minimum(final_hand_34, current_hand_34)
         raw_reward = np.sum(overlap * unit_score)
@@ -404,4 +406,4 @@ def create_default_calculator() -> MahjongRewardCalculator:
     # 🆕 方案四：score_norm_factor=10000（v2 為 1000）
     # r_backward 非線性放大後（score^1.5），reward 範圍從 0.003~0.03 升到 0.03~0.68，
     # 需要更大的正規化因子才能控制 rtg 累積不至於讓 Value Head 爆炸
-    return MahjongRewardCalculator(base_exp_score=2000.0, score_norm_factor=10000.0, penalty_weight=2.0)
+    return MahjongRewardCalculator(base_exp_score=2000.0, score_norm_factor=10000.0, penalty_weight=2.0, potential_weight=0.3)
