@@ -28,9 +28,9 @@ class MultiGrainedBlock(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        
-        self.conv1d_cg = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
-        self.conv1d_fg = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+
+        self.conv1d_cg = nn.Conv1d(d_model, d_model, kernel_size=3, padding=2)
+        self.conv1d_fg = nn.Conv1d(d_model, d_model, kernel_size=3, padding=2)
         
         self.proj_z_cg = LoRALinear(d_model, d_model)
         self.proj_z_fg = LoRALinear(d_model, d_model)
@@ -44,8 +44,11 @@ class MultiGrainedBlock(nn.Module):
     def forward(self, h_i_minus_1):
         h_i = self.norm(h_i_minus_1)
         
-        h_cg_in = F.silu(self.conv1d_cg(h_i.transpose(1, 2)).transpose(1, 2))
-        h_fg_in = F.silu(self.conv1d_fg(h_i.transpose(1, 2)).transpose(1, 2))
+        h_cg_conv = self.conv1d_cg(h_i.transpose(1, 2))[:, :, :-2].transpose(1, 2)
+        h_fg_conv = self.conv1d_fg(h_i.transpose(1, 2))[:, :, :-2].transpose(1, 2)
+        
+        h_cg_in = F.silu(h_cg_conv)
+        h_fg_in = F.silu(h_fg_conv)
         
         z_cg = self.proj_z_cg(h_i_minus_1)
         z_fg = self.proj_z_fg(h_i_minus_1)
@@ -62,15 +65,6 @@ class MultiGrainedBlock(nn.Module):
 
 class DecisionMamba(nn.Module):
     def __init__(self, d_model=512, action_dim=181, state_dim=1380, max_ep_len=2048):
-        """
-        Decision Mamba 模型
-        
-        Args:
-            d_model: 隐层维度
-            action_dim: 动作空间维度 (mjx 使用 181 种动作)
-            state_dim: 状态特征维度 (1380 维)
-            max_ep_len: 最大轨迹长度
-        """
         super().__init__()
         self.embed_rtg = nn.Linear(1, d_model)
         self.embed_state = nn.Linear(state_dim, d_model)
@@ -82,34 +76,44 @@ class DecisionMamba(nn.Module):
         
         self.head_action = nn.Linear(d_model, action_dim) 
         self.head_rtg = nn.Linear(d_model, 1)
-        self.head_state = nn.Linear(d_model, state_dim)  # State prediction head
+        self.head_state = nn.Linear(d_model, state_dim)
 
     def prepare_for_ppo(self):
-        print("Freezing backbone and enabling LoRA for PPO fine-tuning...")
+        """
+        🔒 凍結 Backbone（embedding / input_proj / SSM / conv / LayerNorm），
+        僅保留 LoRA 注入層（lora_A, lora_B）+ Actor/Critic/State Head 可訓練。
         
+        這確保：
+        1. LoRA 低秩適配真正發揮作用（不讓 backbone 被 PPO 拉扯偏離 BC 策略）
+        2. 顯存使用極小化（>95% 參數凍結）
+        3. 防止災難性遺忘
+        """
+        print("🔒 啟用 LoRA 模式：凍結 Backbone，僅訓練 LoRA 注入層 + Actor/Critic Head...")
+        
+        # 第一階段：全部凍結
         for param in self.parameters():
             param.requires_grad = False
-            
+        
+        # 第二階段：選擇性解凍 — 僅 LoRA 參數 + 三個輸出 Head
         for name, param in self.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name:
+            # LoRA 低秩矩陣（存在於 MultiGrainedBlock 內的 LoRALinear）
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
+            # 輸出 Head（需要從頭學習 PPO 的 policy/value/state 預測）
+            elif name.startswith("head_action.") or name.startswith("head_rtg.") or name.startswith("head_state."):
                 param.requires_grad = True
         
-        for param in self.head_action.parameters():
-            param.requires_grad = True
-        for param in self.head_rtg.parameters():
-            param.requires_grad = True
+        # 統計
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"   可訓練: {trainable:,} / 凍結: {total - trainable:,} (比例: {trainable / total * 100:.2f}%)")
 
     def forward(self, rtg, state, action, timesteps=None):
-        # 處理無效的動作（padding 標記為 -100，替換為 0）
         action_safe = torch.where(action < 0, torch.tensor(0, device=action.device, dtype=action.dtype), action)
         
-        # 連接三個嵌入向量：(batch, seq_len, 3*d_model)
         e_concat = torch.cat([self.embed_rtg(rtg), self.embed_state(state), self.embed_action(action_safe)], dim=-1)
-        
-        # 投影到 d_model 維度：(batch, seq_len, d_model)
         h0 = self.input_proj(e_concat)
         
-        # 添加時間步嵌入
         if timesteps is not None:
             h0 = h0 + self.embed_timestep(timesteps)
             

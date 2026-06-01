@@ -24,6 +24,7 @@ import torch.optim as optim
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+from collections import deque
 import argparse
 import sys
 
@@ -40,18 +41,25 @@ from train_ppo_step import train_ppo_epoch
 def train_ppo(
     bc_checkpoint_path: str = "/workspace/Mahjong/checkpoints/bc_model/best_bc_model.pt",
     num_iterations: int = 1000,
-    ppo_epochs: int = 4,
-    learning_rate: float = 1e-4,
+    ppo_epochs: int = 1,
+    learning_rate: float = 5e-5,
     device: str = "cuda",
-    checkpoint_dir: str = "/workspace/Mahjong/checkpoints/ppo_model",
+    checkpoint_dir: str = "/workspace/Mahjong/checkpoints/ppo_lora_v3",
     opponent_pool_size: int = 5,
     update_opponent_every: int = 10,
     save_every: int = 50,
     log_every: int = 1,
+    game_stats_window: int = 50,  # 🆕 滑動窗口大小（計算贏牌率等）
     d_model: int = 512,
     action_dim: int = 181,
     state_dim: int = 1380,
     max_ep_len: int = 2048,
+    # 🆕 LoRA PPO 超參數
+    temperature: float = 2.0,
+    entropy_coef: float = 0.05,
+    value_coef: float = 0.5,
+    clip_epsilon: float = 0.2,
+    max_grad_norm: float = 0.5,
 ):
     """
     LoRA + PPO 自我博弈線上微調主訓練迴圈。
@@ -59,18 +67,24 @@ def train_ppo(
     Args:
         bc_checkpoint_path: BC 預訓練模型權重路徑
         num_iterations: PPO 訓練迭代次數（每迭代 = 一局自我博弈 + PPO 更新）
-        ppo_epochs: 每條軌跡的 PPO 更新 epoch 數
-        learning_rate: 學習率（僅作用於 LoRA + Actor/Critic head）
+        ppo_epochs: 每條軌跡的 PPO 更新 epoch 數（LoRA 建議 1）
+        learning_rate: 學習率（5e-5，LoRA 建議小步伐）
         device: 計算設備
         checkpoint_dir: PPO 模型保存路徑
         opponent_pool_size: 對手池大小
         update_opponent_every: 每 N 次迭代更新一次對手池
         save_every: 每 N 次迭代保存一次 checkpoint
         log_every: 每 N 次迭代輸出一次日誌
+        game_stats_window: 遊戲指標滑動窗口大小
         d_model: 隱藏層維度
         action_dim: 動作空間維度（mjx 使用 181 種動作）
         state_dim: 狀態特徵維度（decision-mamba-v0 = 1380 維）
         max_ep_len: 最大軌跡長度
+        temperature: Logit 採樣溫度（2.0~2.5，拉平極端分佈重新打開梯度通道）
+        entropy_coef: 策略熵係數（0.03~0.05，控制探索強度）
+        value_coef: Value Loss 權重（0.5，平衡 Critic 與 Actor）
+        clip_epsilon: PPO 裁剪閾值（0.2，安全閥）
+        max_grad_norm: 梯度裁剪閾值（0.5，防止梯度爆炸）
     """
     # ========== 1. 設備設置 ==========
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -85,7 +99,7 @@ def train_ppo(
         max_ep_len=max_ep_len,
     )
 
-    checkpoint = torch.load(bc_checkpoint_path, map_location=device)
+    checkpoint = torch.load(bc_checkpoint_path, map_location=device, weights_only=False)
     # 支援直接載入 state_dict 或包裝後的 checkpoint dict
     if "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -110,7 +124,6 @@ def train_ppo(
     print(f"   可訓練比例: {trainable_params / total_params * 100:.2f}%")
 
     # ========== 4. 建立 Optimizer（只優化 requires_grad=True 的參數）==========
-    # 📌 嚴格遵循 Readme 要求：optimizer 必須只針對可訓練參數
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=learning_rate,
@@ -132,21 +145,35 @@ def train_ppo(
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # 訓練指標歷史記錄
+    # 訓練指標歷史記錄（原有欄位 + 🆕 遊戲結果）
     history = {
         "policy_loss": [],
         "value_loss": [],
         "entropy": [],
         "avg_reward": [],
         "trajectory_length": [],
+        # 🆕 遊戲結果指標
+        "agent_rank": [],
+        "agent_score": [],
+        "is_win": [],
+        "is_agari": [],
     }
+
+    # 🆕 滑動窗口緩衝區（用於計算近 N 局的贏牌率等統計）
+    game_window = deque(maxlen=game_stats_window)
 
     # ========== 7. 主訓練迴圈 ==========
     print(f"\n{'='*70}")
     print(f"🚀 開始 PPO + LoRA 自我博弈訓練")
     print(f"   迭代次數: {num_iterations}")
     print(f"   PPO epochs/局: {ppo_epochs}")
+    print(f"   Temperature: {temperature}")
+    print(f"   Entropy Coef: {entropy_coef}")
+    print(f"   Value Coef: {value_coef}")
+    print(f"   Clip Epsilon: {clip_epsilon}")
+    print(f"   Max Grad Norm: {max_grad_norm}")
     print(f"   對手池更新頻率: 每 {update_opponent_every} 局")
+    print(f"   遊戲指標窗口: 最近 {game_stats_window} 局")
     print(f"   開始時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
 
@@ -154,24 +181,47 @@ def train_ppo(
 
     for iteration in range(1, num_iterations + 1):
         # -------- 7a. 執行一局自我博弈 + PPO 更新 --------
-        # 📌 train_ppo_epoch 內部會：
-        #     1. 呼叫 model.prepare_for_ppo() 確保 LoRA 模式
-        #     2. runner.run_match() 收集軌跡
-        #     3. 計算 GAE 優勢函數
-        #     4. 執行 PPO 損失計算與反向傳播（inline）
         metrics = train_ppo_epoch(
             model=model,
             runner=runner,
             optimizer=optimizer,
             epochs=ppo_epochs,
+            temperature=temperature,
+            entropy_coef=entropy_coef,
+            value_coef=value_coef,
+            clip_epsilon=clip_epsilon,
+            max_grad_norm=max_grad_norm,
         )
 
         # -------- 7b. 記錄指標 --------
         for key in history:
-            history[key].append(metrics[key])
+            if key in metrics:
+                history[key].append(metrics[key])
+        # 🆕 遊戲結果欄位可能不在 old history keys 中，但已加入上方 dict
 
-        # -------- 7c. 定期輸出日誌 --------
+        # -------- 7c. 🆕 累積遊戲結果到滑動窗口 --------
+        game_result = metrics.get("game_result", {})
+        if game_result:
+            history["agent_rank"].append(game_result.get("agent_rank", 3))
+            history["agent_score"].append(game_result.get("agent_score", 0))
+            history["is_win"].append(1 if game_result.get("is_win", False) else 0)
+            history["is_agari"].append(1 if game_result.get("is_agari", False) else 0)
+            game_window.append(game_result)
+
+        # -------- 7d. 定期輸出日誌 --------
         if iteration % log_every == 0:
+            # 🆕 計算滑動窗口統計
+            if len(game_window) > 0:
+                window_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+                window_agari_rate = sum(1 for g in game_window if g.get("is_agari", False)) / len(game_window) * 100
+                window_avg_rank = sum(g.get("agent_rank", 3) for g in game_window) / len(game_window)
+                window_avg_score = sum(g.get("agent_score", 0) for g in game_window) / len(game_window)
+            else:
+                window_win_rate = 0.0
+                window_agari_rate = 0.0
+                window_avg_rank = 3.0
+                window_avg_score = 0.0
+
             print(
                 f"📊 Iter {iteration:>5d}/{num_iterations} | "
                 f"Policy Loss: {metrics['policy_loss']:.4f} | "
@@ -180,15 +230,33 @@ def train_ppo(
                 f"Avg Reward: {metrics['avg_reward']:.4f} | "
                 f"Traj Len: {metrics['trajectory_length']:.1f}"
             )
+            # 🆕 遊戲結果摘要（滑動窗口）
+            print(
+                f"🎮 近{min(len(game_window), game_stats_window)}局 | "
+                f"贏牌率: {window_win_rate:5.1f}% | "
+                f"和了率: {window_agari_rate:5.1f}% | "
+                f"均排名: {window_avg_rank:.2f} | "
+                f"均分數: {window_avg_score:7.0f} | "
+                f"上一局: 排名={game_result.get('agent_rank','?')} "
+                f"分數={game_result.get('agent_score','?'):.0f}pt "
+                f"{'🏆' if game_result.get('is_win') else ''}"
+            )
 
-        # -------- 7d. 更新對手池 --------
+        # -------- 7e. 更新對手池 --------
         if iteration % update_opponent_every == 0:
             print(f"🔄 Iter {iteration}: 更新對手池（當前大小={len(runner.opponent_pool)}）...")
             runner.update_opponent_pool()
 
-        # -------- 7e. 定期保存 Checkpoint --------
+        # -------- 7f. 定期保存 Checkpoint --------
         if iteration % save_every == 0:
             ckpt_path = checkpoint_dir / f"ppo_lora_iter_{iteration}.pt"
+            # 🆕 計算保存時的窗口統計
+            if len(game_window) > 0:
+                save_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+                save_agari_rate = sum(1 for g in game_window if g.get("is_agari", False)) / len(game_window) * 100
+            else:
+                save_win_rate = 0.0
+                save_agari_rate = 0.0
             torch.save(
                 {
                     "iteration": iteration,
@@ -196,14 +264,22 @@ def train_ppo(
                     "optimizer_state_dict": optimizer.state_dict(),
                     "metrics": {k: v[-1] for k, v in history.items()},
                     "history": history,
+                    "window_win_rate": save_win_rate,
+                    "window_agari_rate": save_agari_rate,
+                    "window_size": len(game_window),
                 },
                 ckpt_path,
             )
             print(f"💾 Checkpoint 已保存: {ckpt_path}")
 
-        # -------- 7f. 追蹤最佳模型（按 avg_reward）--------
+        # -------- 7g. 追蹤最佳模型（按 avg_reward）--------
         if metrics["avg_reward"] > best_avg_reward:
             best_avg_reward = metrics["avg_reward"]
+            # 🆕 同時記錄此時的窗口贏牌率
+            if len(game_window) > 0:
+                best_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+            else:
+                best_win_rate = 0.0
             best_ckpt_path = checkpoint_dir / "best_ppo_lora_model.pt"
             torch.save(
                 {
@@ -211,16 +287,20 @@ def train_ppo(
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_avg_reward": best_avg_reward,
+                    "best_win_rate": best_win_rate,
                     "history": history,
                 },
                 best_ckpt_path,
             )
-            print(f"🏆 新最佳模型！Avg Reward: {best_avg_reward:.4f} → {best_ckpt_path}")
+            print(f"🏆 新最佳模型！Avg Reward: {best_avg_reward:.4f} (近{len(game_window)}局贏牌率: {best_win_rate:.1f}%) → {best_ckpt_path}")
 
     # ========== 8. 訓練完成，保存最終模型與日誌 ==========
     print(f"\n{'='*70}")
     print(f"✅ PPO + LoRA 訓練完成")
     print(f"   最佳 Avg Reward: {best_avg_reward:.4f}")
+    if len(game_window) > 0:
+        final_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+        print(f"   最終窗口贏牌率 ({len(game_window)}局): {final_win_rate:.1f}%")
     print(f"   結束時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
 
@@ -273,7 +353,7 @@ def main():
     )
     parser.add_argument(
         "--checkpoint-dir", type=str,
-        default="/workspace/Mahjong/checkpoints/ppo_model",
+        default="/workspace/Mahjong/checkpoints/ppo_lora_v4",
         help="PPO checkpoint 輸出目錄",
     )
 
@@ -283,12 +363,33 @@ def main():
         help="PPO 訓練迭代次數（每迭代 = 一局自我博弈 + PPO 更新）",
     )
     parser.add_argument(
-        "--ppo-epochs", type=int, default=4,
-        help="每條軌跡的 PPO 更新 epoch 數",
+        "--ppo-epochs", type=int, default=1,
+        help="每條軌跡的 PPO 更新 epoch 數（LoRA 建議 1）",
     )
     parser.add_argument(
-        "--learning-rate", type=float, default=1e-4,
+        "--learning-rate", type=float, default=5e-5,
         help="學習率（僅作用於 LoRA + Actor/Critic head）",
+    )
+    # 🆕 LoRA PPO 超參數
+    parser.add_argument(
+        "--temperature", type=float, default=2.0,
+        help="Logit 採樣溫度（2.0~2.5，拉平極端分佈重新打開梯度通道）",
+    )
+    parser.add_argument(
+        "--entropy-coef", type=float, default=0.05,
+        help="策略熵係數（0.03~0.05，控制探索強度）",
+    )
+    parser.add_argument(
+        "--value-coef", type=float, default=0.5,
+        help="Value Loss 權重（平衡 Critic 與 Actor 學習速度）",
+    )
+    parser.add_argument(
+        "--clip-epsilon", type=float, default=0.2,
+        help="PPO 裁剪閾值（安全閥，防止極端獎勵拉偏 Policy）",
+    )
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=0.5,
+        help="梯度裁剪閾值（防止 GAE 劇烈變動導致梯度爆炸）",
     )
     parser.add_argument(
         "--device", type=str, default="cuda",
@@ -312,8 +413,11 @@ def main():
         "--log-every", type=int, default=1,
         help="每 N 次迭代輸出一次日誌",
     )
+    parser.add_argument(
+        "--game-stats-window", type=int, default=50,
+        help="遊戲指標滑動窗口大小（計算贏牌率等）",
+    )
 
-    # ---- 模型架構參數（需與 BC 預訓練一致）----
     parser.add_argument(
         "--d-model", type=int, default=512,
         help="隱藏層維度",
@@ -357,10 +461,16 @@ def main():
         update_opponent_every=args.update_opponent_every,
         save_every=args.save_every,
         log_every=args.log_every,
+        game_stats_window=args.game_stats_window,
         d_model=args.d_model,
         action_dim=args.action_dim,
         state_dim=args.state_dim,
         max_ep_len=args.max_ep_len,
+        temperature=args.temperature,
+        entropy_coef=args.entropy_coef,
+        value_coef=args.value_coef,
+        clip_epsilon=args.clip_epsilon,
+        max_grad_norm=args.max_grad_norm,
     )
 
 

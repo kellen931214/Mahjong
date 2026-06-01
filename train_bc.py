@@ -4,6 +4,7 @@
 """
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -179,15 +180,19 @@ def train_bc(
 def main():
     parser = argparse.ArgumentParser(description='BC訓練腳本')
     parser.add_argument('--npz-file', type=str, 
-                       default='/workspace/Mahjong/converted_features_npy',
-                       help='轉換後的特徵文件路徑或包含 Chunks 的目錄')
+                       default='/nvme_data/converted_features_npy',
+                       help='轉換後的特徵文件路徑或包含 Chunks 的目錄（預設位於 NVMe 高速儲存）')
     parser.add_argument('--batch-size', type=int, default=256, help='批次大小')
-    parser.add_argument('--num-epochs', type=int, default=10, help='訓練輪數')
+    parser.add_argument('--num-epochs', type=int, default=100, help='訓練輪數')
     parser.add_argument('--learning-rate', type=float, default=1e-3, help='學習率')
     parser.add_argument('--val-split', type=float, default=0.2, help='驗證集比例')
     parser.add_argument('--device', type=str, default='cuda', help='計算設備')
     parser.add_argument('--seed', type=int, default=42, help='隨機種子')
     parser.add_argument('--d-model', type=int, default=512, help='隐层维度')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='DataLoader 的 worker 數量（NVMe/SSD 建議 4~8，HDD 建議 1~2）')
+    parser.add_argument('--prefetch-factor', type=int, default=2,
+                        help='每個 worker 預先載入的 batch 數量')
     parser.add_argument('--max-samples', type=int, default=None,
                         help='限制使用的總軌跡數量（用於快速測試，預設使用全部）')
     
@@ -218,14 +223,15 @@ def main():
         generator=torch.Generator().manual_seed(args.seed)
     )
     
-    # ✨ 核心優化點：限制 num_workers 與 prefetch_factor
-    # 配合 mmap 模式，設為 2 個 worker 可以讓資料搬運速度最優化，同時避免 Linux 進程間複製 (IPC) 撐爆 RAM
+    # ✨ NVMe 環境下可安全使用較多 worker，prefetch 與 pin_memory 進一步加速
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=bc_collate_fn,
-        num_workers=2,            # 📌 .npy + mmap 在 fork 後安全，開 2 workers 加速
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=True if args.num_workers > 0 else False,
         pin_memory=True,
     )
     
@@ -234,7 +240,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=bc_collate_fn,
-        num_workers=2,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=True if args.num_workers > 0 else False,
         pin_memory=True,
     )
     
@@ -265,4 +273,5 @@ def main():
 
 
 if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
     main()

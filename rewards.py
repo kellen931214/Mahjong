@@ -35,14 +35,17 @@ class MahjongRewardCalculator:
         self,
         base_exp_score: float = 2000.0,
         score_norm_factor: float = 10000.0,
+        penalty_weight: float = 2.0,
     ):
         """
         Args:
             base_exp_score: 預設期望打點（用於 r_potential 的基準分）
             score_norm_factor: 正規化因子，避免 PPO 梯度爆炸
+            penalty_weight: 放銃懲罰倍率（方案四：預設 2.0，加重防守意識）
         """
         self.base_exp_score = base_exp_score
         self.score_norm_factor = score_norm_factor
+        self.penalty_weight = penalty_weight
 
     # ==================== 共用輔助方法 ====================
 
@@ -118,6 +121,56 @@ class MahjongRewardCalculator:
 
         return counts
 
+    # ==================== 🆕 方案四：寶牌相關方法 ====================
+
+    def count_dora_in_hand(self, obs: mjx.Observation) -> int:
+        """
+        計算手牌（含副露）中的寶牌張數。
+        
+        寶牌來源：
+        1. 赤寶牌（tile.is_red()）
+        2. 寶牌指示牌對應的寶牌（obs.doras() → 指示牌種類，寶牌為指示牌+1）
+
+        對齊 mjx 的 dora_num_in_hand feature 計算邏輯。
+        
+        Returns:
+            dora_count: 手牌中寶牌總張數（上限 13）
+        """
+        dora_indicators = list(obs.doras())  # 寶牌指示牌種類列表
+        dora_count = 0
+
+        # 檢查手牌中的 closed tiles
+        for tile in obs.curr_hand().closed_tiles():
+            if tile.is_red():
+                dora_count += 1
+            for dora_type in dora_indicators:
+                if tile.type() == dora_type:
+                    dora_count += 1
+
+        # 檢查副露中的 tiles
+        for meld in obs.curr_hand().opens():
+            for tile in meld.tiles():
+                if tile.is_red():
+                    dora_count += 1
+                for dora_type in dora_indicators:
+                    if tile.type() == dora_type:
+                        dora_count += 1
+
+        return min(dora_count, 13)
+
+    def calculate_dora_potential_reward(self, obs: mjx.Observation) -> float:
+        """
+        r_dora = dora_count × 0.5 / norm_factor
+
+        即時獎勵，鼓勵模型保留寶牌以追求高價值牌型。
+        每多一張寶牌，獎勵增加 0.5/1000。
+        
+        Returns:
+            正規化後的寶牌潛力獎勵
+        """
+        dora_count = self.count_dora_in_hand(obs)
+        return dora_count * 0.5 / self.score_norm_factor
+
     # ==================== 1. r_potential — 進攻潛力 ====================
 
     def calculate_ukeire(self, obs: mjx.Observation) -> int:
@@ -191,6 +244,10 @@ class MahjongRewardCalculator:
         對齊 Readme.md Eq.12。
         將最終得分按牌型比例均分，回饋給每一步中與最終牌型重合的牌。
 
+        🆕 方案四：非線性獎勵 — 使用 score² 放大高分牌的 reward
+            unit_score = final_score² / (total_tiles × score_norm_factor)
+            效果：45分→2.0, 90分→8.1（4倍差距，鼓勵做大牌）
+
         Args:
             final_hand_34: 最終和牌型的 34 維張數分佈
             final_score: 最終得分（正整數）
@@ -200,13 +257,15 @@ class MahjongRewardCalculator:
         if total_tiles == 0:
             return 0.0
 
-        # 單位張數得分（簡化均分）
-        unit_score = final_score / total_tiles
+        # 🆕 方案四：非線性單位得分（score^1.5），放大大牌價值但避免 Value Loss 爆炸
+        # score² 會讓 reward 範圍 2~130（對 45~360 分），Critic 無法收斂
+        # score^1.5 將範圍控制在 0.3~7，仍保持大牌 > 小牌的非線性
+        unit_score = (final_score * np.sqrt(final_score)) / (total_tiles * self.score_norm_factor)
 
         overlap = np.minimum(final_hand_34, current_hand_34)
         raw_reward = np.sum(overlap * unit_score)
 
-        return raw_reward / self.score_norm_factor
+        return raw_reward
 
     # ==================== 3. r_penalty — 防守懲罰 ====================
 
@@ -241,8 +300,10 @@ class MahjongRewardCalculator:
         self, obs: mjx.Observation, opponent_score: Optional[float] = None
     ) -> float:
         """
-        r_penalty = -對手得分 / norm_factor（如果自己放銃）
+        r_penalty = -對手得分 × penalty_weight / norm_factor（如果自己放銃）
         對齊 Readme.md Eq.13
+        
+        🆕 方案四：penalty_weight=2.0，放銃懲罰加倍，鼓勵防守
 
         Args:
             obs: 當前 observation
@@ -250,8 +311,32 @@ class MahjongRewardCalculator:
         """
         is_houjuu = self.check_houjuu(obs)
         if is_houjuu and opponent_score is not None:
-            return -abs(opponent_score) / self.score_norm_factor
+            return -abs(opponent_score) * self.penalty_weight / self.score_norm_factor
         return 0.0
+
+    # ==================== 4. r_progression — 進步獎勵 ====================
+
+    def calculate_progression_reward(
+        self,
+        prev_shanten: Optional[int],
+        curr_shanten: int,
+    ) -> float:
+        """
+        r_progression = (prev_shanten - curr_shanten) * progression_scale / norm_factor
+        
+        鼓勵向聽數下降（進展），懲罰向聽數上升（倒退）。
+        
+        Args:
+            prev_shanten: 前一步的向聽數（第一步為 None）
+            curr_shanten: 當前步的向聽數
+        Returns:
+            正規化後的進步獎勵
+        """
+        if prev_shanten is None:
+            return 0.0
+        delta = prev_shanten - curr_shanten  # 正值=進步, 負值=退步
+        progression_scale = 1.0
+        return delta * progression_scale / self.score_norm_factor
 
     # ==================== 整合方法 ====================
 
@@ -265,6 +350,8 @@ class MahjongRewardCalculator:
         """
         計算單步完整獎勵。
 
+        🆕 方案四：R_total = r_potential + r_dora + r_backward + r_penalty
+
         Args:
             obs: 當前 observation
             final_hand_34: 最終和牌型（round 結束後，用於 r_backward）
@@ -274,6 +361,7 @@ class MahjongRewardCalculator:
             正規化後的總獎勵
         """
         r_potential = self.calculate_potential_reward(obs)
+        r_dora = self.calculate_dora_potential_reward(obs)  # 🆕 方案四
         r_penalty = self.calculate_penalty_reward(obs, opponent_score)
 
         r_backward = 0.0
@@ -283,7 +371,7 @@ class MahjongRewardCalculator:
                 final_hand_34, final_score, current_hand
             )
 
-        return r_potential + r_backward + r_penalty
+        return r_potential + r_dora + r_backward + r_penalty
 
     def compute_trajectory_rewards(
         self,
@@ -313,4 +401,7 @@ class MahjongRewardCalculator:
 
 def create_default_calculator() -> MahjongRewardCalculator:
     """建立預設參數的獎勵計算機。"""
-    return MahjongRewardCalculator(base_exp_score=2000.0, score_norm_factor=10000.0)
+    # 🆕 方案四：score_norm_factor=10000（v2 為 1000）
+    # r_backward 非線性放大後（score^1.5），reward 範圍從 0.003~0.03 升到 0.03~0.68，
+    # 需要更大的正規化因子才能控制 rtg 累積不至於讓 Value Head 爆炸
+    return MahjongRewardCalculator(base_exp_score=2000.0, score_norm_factor=10000.0, penalty_weight=2.0)
