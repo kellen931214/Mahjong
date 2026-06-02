@@ -262,60 +262,98 @@ def _update_game_state(state: GameState, evt: Dict) -> None:
                 if t_type != -1 and t_type in state.hands[actor]: 
                     state.hands[actor].remove(t_type)
 
-def extract_game_trajectories(events: List[Dict]) -> List[List[Dict]]:
-    start_kyoku = next((e for e in events if e.get('type') == 'start_kyoku'), None)
-    if not start_kyoku: return [[] for _ in range(4)]
-    
-    # 【新增】記錄起始分數，以便局終時計算分數差額 (Delta)
-    start_scores = start_kyoku.get('scores', [25000] * 4)
-    end_scores = start_scores.copy() 
-    
-    state = GameState(
-        round_num=start_kyoku.get('kyoku', 0) - 1,
-        honba=start_kyoku.get('honba', 0),
-        kyotaku=start_kyoku.get('kyotaku', 0),
-        hands=[[TILE_STR_TO_TYPE.get(t, -1) for t in start_kyoku.get('tehais', [[]])[i] if t in TILE_STR_TO_TYPE] for i in range(4)],
+def _reset_game_state_for_kyoku(start_kyoku_event: Dict, cumulative_scores: list) -> GameState:
+    """根據 start_kyoku 事件，重置一局新遊戲的狀態（保留跨局累積分數）"""
+    return GameState(
+        round_num=start_kyoku_event.get('kyoku', 0) - 1,
+        honba=start_kyoku_event.get('honba', 0),
+        kyotaku=start_kyoku_event.get('kyotaku', 0),
+        hands=[[TILE_STR_TO_TYPE.get(t, -1) for t in start_kyoku_event.get('tehais', [[]])[i] if t in TILE_STR_TO_TYPE] for i in range(4)],
         discards=[[] for _ in range(4)], melds=[[] for _ in range(4)],
-        scores=start_scores, # 使用剛才抓取的 start_scores
-        dora_indicators=[TILE_STR_TO_TYPE.get(start_kyoku.get('dora_marker', ''), 0)],
-        dealer=start_kyoku.get('oya', 0),
-        prevalent_wind=start_kyoku.get('bakaze', 'E')
+        scores=list(cumulative_scores),
+        dora_indicators=[TILE_STR_TO_TYPE.get(start_kyoku_event.get('dora_marker', ''), 0)],
+        dealer=start_kyoku_event.get('oya', 0),
+        prevalent_wind=start_kyoku_event.get('bakaze', 'E')
     )
+
+def _extract_final_scores(events: List[Dict]) -> Optional[list]:
+    """遍歷整個事件序列，從初始分數累加所有 deltas，計算遊戲最終累積分數"""
+    cumulative = None
+    for evt in events:
+        if evt.get('type') == 'start_kyoku' and cumulative is None:
+            cumulative = list(evt.get('scores', [25000] * 4))
+        if evt.get('type') in ['hora', 'ryukyoku']:
+            if 'scores' in evt:
+                cumulative = list(evt['scores'])
+            elif 'deltas' in evt:
+                cumulative = [cumulative[i] + evt['deltas'][i] for i in range(4)]
+    return cumulative
+
+def extract_game_trajectories(events: List[Dict]) -> List[List[Dict]]:
+    """
+    從一個完整半莊（多局）的 mjson 事件中，提取每位玩家的跨局 trajectory。
     
+    改動：串聯多局，RTG 在每局邊界變化：
+      RTG_t = (final_game_score - cumulative_score_at_t) / 10000
+    
+    先前版本僅處理第一局，且 RTG 為常數。
+    """
+    decision_events = {'dahai', 'chi', 'pon', 'kan', 'ankan', 'kakan', 'reach', 'hora', 'none'}
     trajectories = [[] for _ in range(4)]
-    decision_events = ['dahai', 'chi', 'pon', 'kan', 'ankan', 'kakan', 'reach', 'hora', 'none']
+    
+    # 1. 找最終分數（用於計算 RTG）
+    final_scores = _extract_final_scores(events)
+    if final_scores is None:
+        return [[] for _ in range(4)]  # 沒有最終分數，無法計算 RTG
+    
+    # 2. 初始化跨局累積分數與遊戲狀態
+    cumulative_scores = None
+    state = None
     
     for evt in events:
         evt_type = evt.get('type')
         actor = evt.get('actor', -1)
         
-        # 【新增】擷取局終事件，更新最終分數
+        # --- 新局開始：重置局狀態 ---
+        if evt_type == 'start_kyoku':
+            if cumulative_scores is None:
+                cumulative_scores = list(evt.get('scores', [25000] * 4))
+            state = _reset_game_state_for_kyoku(evt, cumulative_scores)
+            continue
+        
+        if state is None:
+            continue  # 還沒遇到 start_kyoku，跳過
+        
+        # --- 局終：更新累積分數 ---
         if evt_type in ['hora', 'ryukyoku']:
             if 'scores' in evt:
-                end_scores = evt['scores']
-            elif 'deltas' in evt: # 防呆：有些 mjson 只有 deltas
-                end_scores = [start_scores[i] + evt['deltas'][i] for i in range(4)]
+                cumulative_scores = list(evt['scores'])
+            elif 'deltas' in evt:
+                cumulative_scores = [cumulative_scores[i] + evt['deltas'][i] for i in range(4)]
         
+        # --- 決策事件：立即計算當前 RTG，寫入軌跡 ---
         if evt_type in decision_events and 0 <= actor < 4:
-            if evt_type == 'reach' and evt.get('step') != 1: pass
-            else:
-                try:
-                    features = FeatureExtractor(actor).extract_features(state)
-                    action_code = _encode_action_mjx(evt_type, evt)
-                    trajectories[actor].append({'features': features, 'action': action_code})
-                except Exception as e: pass
-                
-        _update_game_state(state, evt)
-        
-    # 【新增】迴圈結束後，計算每位玩家的真實 RTG，並賦予給軌跡中的每一個 step
-    for p in range(4):
-        # 計算真實分數差，並除以 10000 進行正規化
-        score_delta = end_scores[p] - start_scores[p]
-        rtg_value = score_delta / 10000.0  
-        
-        for step_data in trajectories[p]:
-            step_data['rtg'] = rtg_value # 寫入 RTG
+            # reach 只取 step == 1 的宣告立直決策
+            if evt_type == 'reach' and evt.get('step') != 1:
+                _update_game_state(state, evt)
+                continue
             
+            try:
+                features = FeatureExtractor(actor).extract_features(state)
+                action_code = _encode_action_mjx(evt_type, evt)
+                # 🔑 關鍵改動：RTG = (最終分數 - 當前累積分數) / 10000
+                rtg = (final_scores[actor] - cumulative_scores[actor]) / 10000.0
+                trajectories[actor].append({
+                    'features': features,
+                    'action': action_code,
+                    'rtg': rtg
+                })
+            except Exception:
+                pass
+        
+        # 無論是否為決策事件，都更新狀態（摸牌、副露等也需反映）
+        _update_game_state(state, evt)
+    
     return trajectories
 
 def convert_mjson_directory(data_dir: str, output_dir: str, max_files: int = -1) -> None:
