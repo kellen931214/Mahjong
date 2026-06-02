@@ -324,14 +324,7 @@ def extract_game_trajectories(events: List[Dict]) -> List[List[Dict]]:
         if state is None:
             continue  # 還沒遇到 start_kyoku，跳過
         
-        # --- 局終：更新累積分數 ---
-        if evt_type in ['hora', 'ryukyoku']:
-            if 'scores' in evt:
-                cumulative_scores = list(evt['scores'])
-            elif 'deltas' in evt:
-                cumulative_scores = [cumulative_scores[i] + evt['deltas'][i] for i in range(4)]
-        
-        # --- 決策事件：立即計算當前 RTG，寫入軌跡 ---
+        # --- 決策事件：記錄特徵與 RTG（必須在分數結算之前！確保 features.scores 與 cumulative_scores 一致） ---
         if evt_type in decision_events and 0 <= actor < 4:
             # reach 只取 step == 1 的宣告立直決策
             if evt_type == 'reach' and evt.get('step') != 1:
@@ -339,9 +332,10 @@ def extract_game_trajectories(events: List[Dict]) -> List[List[Dict]]:
                 continue
             
             try:
+                # 此時 features（state.scores）與 cumulative_scores 皆為當局開局分數，完美對齊
                 features = FeatureExtractor(actor).extract_features(state)
                 action_code = _encode_action_mjx(evt_type, evt)
-                # 🔑 關鍵改動：RTG = (最終分數 - 當前累積分數) / 10000
+                # 🔑 RTG = (最終分數 - 當前累積分數) / 10000
                 rtg = (final_scores[actor] - cumulative_scores[actor]) / 10000.0
                 trajectories[actor].append({
                     'features': features,
@@ -351,8 +345,15 @@ def extract_game_trajectories(events: List[Dict]) -> List[List[Dict]]:
             except Exception:
                 pass
         
-        # 無論是否為決策事件，都更新狀態（摸牌、副露等也需反映）
+        # 無論是否為決策事件，都更新狀態（摸牌、副露、牌河等）
         _update_game_state(state, evt)
+        
+        # --- 局終：更新累積分數（移到最下方！確保當局所有動作含 hora 都用舊分數計算 RTG） ---
+        if evt_type in ['hora', 'ryukyoku']:
+            if 'scores' in evt:
+                cumulative_scores = list(evt['scores'])
+            elif 'deltas' in evt:
+                cumulative_scores = [cumulative_scores[i] + evt['deltas'][i] for i in range(4)]
     
     return trajectories
 
