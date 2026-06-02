@@ -118,7 +118,7 @@ class BehavioralCloningDataset(Dataset):
         
         return { 
             'state': states, 
-            'action': actions, 
+            'target_action': actions, 
             'rtg': rtgs,  
             'timesteps': timesteps, 
             'length': length 
@@ -126,16 +126,38 @@ class BehavioralCloningDataset(Dataset):
 
 def bc_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]: 
     """ 
-    BC訓練的批次處理函數（自動補零對齊）
+    BC訓練的批次處理函數（自動補零對齊 ＋ 自迴歸右移防漏題機制）
     """ 
     states_list = [item['state'] for item in batch] 
-    actions_list = [item['action'] for item in batch] 
+    actions_list = [item['target_action'] for item in batch] 
     rtgs_list = [item['rtg'] for item in batch] 
     timesteps_list = [item['timesteps'] for item in batch] 
     lengths = torch.tensor([item['length'] for item in batch], dtype=torch.long) 
       
     state_padded = pad_sequence(states_list, batch_first=True, padding_value=0.0) 
-    action_padded = pad_sequence(actions_list, batch_first=True, padding_value=-100) 
+    
+    # ------------------------------------------------------------
+    # ✨【核心修正】落實自迴歸 Shift 機制，防止 Look-Ahead Leakage
+    # ------------------------------------------------------------
+    # target_action 是模型要預測的真實答案標籤（包含當前步 a_t）
+    target_action = pad_sequence(actions_list, batch_first=True, padding_value=-100) 
+    
+    # input_action 是要餵給模型 Embedding 的輸入特徵。
+    # 我們複製一份 target_action，然後將所有序列強制向右平移一格
+    input_action = target_action.clone()
+    
+    # 1. 將時序截斷，去掉最後一個動作 a_T (因為它不需要用來預測任何未來的狀態)
+    input_action = input_action[:, :-1]
+    
+    # 2. 在序列最開頭 (Step 1) 插入一個 Padding Token：編碼 180 (DUMMY)
+    #    這樣當模型在 Step 1 預測 a_1 時，輸入特徵只會看到 [s_1, DUMMY]，絕不漏題
+    dummy_prefixes = torch.ones((input_action.shape[0], 1), dtype=torch.long) * 180
+    input_action = torch.cat([dummy_prefixes, input_action], dim=1)
+    
+    # 將 input_action 中被 target_action padding (-100) 波及的位置也填回 DUMMY
+    input_action = torch.where(input_action < 0, torch.tensor(180, dtype=torch.long), input_action)
+    # ------------------------------------------------------------
+    
     tg_padded = pad_sequence(rtgs_list, batch_first=True, padding_value=0.0) 
     timesteps_padded = pad_sequence(timesteps_list, batch_first=True, padding_value=0) 
       
@@ -144,7 +166,8 @@ def bc_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
       
     return { 
         'state': state_padded,        
-        'action': action_padded,      
+        'input_action': input_action,   # ✨ 餵給模型 Token Embedding 的安全輸入 (Shift 歷史)
+        'target_action': target_action, # ✨ 丟進 CrossEntropyLoss 的真實答案標籤 (包含當前步)
         'rtg': tg_padded,            
         'timesteps': timesteps_padded,  
         'lengths': lengths,           

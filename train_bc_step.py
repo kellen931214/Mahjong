@@ -15,17 +15,12 @@ def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1)):
     
     rtg = batch["rtg"].to(device)               
     state = batch["state"].to(device)           
-    target_action = batch["action"].to(device)  
+    target_action = batch["target_action"].to(device)  
+    input_action = batch["input_action"].to(device)   # 已在 bc_collate_fn 完成自迴歸右移
     timesteps = batch["timesteps"].to(device)   
     
-    batch_size, seq_len = target_action.shape
-    
-    # ============ ✅ 修正：僅對 action 進行右移，其餘模態保持當前步 ============
-    start_token = torch.full((batch_size, 1), 180, dtype=torch.long, device=device)
-    input_action = torch.cat([start_token, target_action[:, :-1]], dim=1)
-    input_action = torch.where(input_action < 0, torch.tensor(180, device=device), input_action)
-    
-    # 獲取模型的三個輸出（rtg 與 state 傳入當前步，不進行位移）
+
+
     pred_action, pred_rtg, pred_state, _ = model(
         rtg=rtg, 
         state=state, 

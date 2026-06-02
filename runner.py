@@ -134,7 +134,14 @@ class SelfPlayRunner:
                     probs = torch.ones(len(legal_indices), device=self.device) / len(legal_indices)
             
             action_idx = torch.multinomial(probs, 1).item()
-            mjx_action = next((a for a in legal_actions if hasattr(a, 'to_idx') and a.to_idx() == action_idx), legal_actions[0])
+            mjx_action = None
+            for a in legal_actions:
+                if hasattr(a, 'to_idx') and a.to_idx() == action_idx:
+                    mjx_action = a
+                    break
+            if mjx_action is None:
+                print(f"⚠️ 警告：action_idx {action_idx} 無法對應到任何合法動作，fallback 至 legal_actions[0]")
+                mjx_action = legal_actions[0]
             
             # 🚀 動作做出後，才正式登記進歷史清單，供下一手使用
             # 所有歷史（obs/act/rtg/timestep）同步增長，確保維度永遠一致

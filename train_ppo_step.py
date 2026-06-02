@@ -197,8 +197,10 @@ def train_ppo_epoch(
 
         probs = F.softmax(masked_logits, dim=-1)
 
-        # 0.0 * (-1e9) = 0.0（不是 NaN！），正向反向都乾淨
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
+        # 只對合法動作計算熵，避免大量「死 token」低估真實策略集中度
+        legal_probs = probs * legal_mask.float()
+        legal_log_probs = torch.where(legal_mask, log_probs, torch.tensor(0.0, device=device))
+        entropy = -(legal_probs * legal_log_probs).sum(dim=-1).mean()
 
         # PPO 損失
         ratio = torch.exp(new_log_probs - target_log_probs.squeeze(0))  # (T,)
