@@ -180,7 +180,7 @@ def train_bc(
 def main():
     parser = argparse.ArgumentParser(description='BC訓練腳本')
     parser.add_argument('--npz-file', type=str, 
-                       default='/nvme_data/converted_features_npy',
+                       default='/data/converted_features_npy',
                        help='轉換後的特徵文件路徑或包含 Chunks 的目錄（預設位於 NVMe 高速儲存）')
     parser.add_argument('--batch-size', type=int, default=256, help='批次大小')
     parser.add_argument('--num-epochs', type=int, default=100, help='訓練輪數')

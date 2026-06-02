@@ -59,7 +59,7 @@ class MjxActionEncoder:
             if base_tile <= 17: return (base_tile % 9) + 81
             return (base_tile % 9) + 88
         else:
-            return {3: 95, 4: 96, 5: 97, 12: 98, 13: 99, 14: 100, 21: 101, 22: 102, 23: 103}.get(base_tile, 95)
+            return {2: 95, 3: 96, 4: 97, 11: 98, 12: 99, 13: 100, 20: 101, 21: 102, 22: 103}.get(base_tile, 74)
     
     @staticmethod
     def encode_pon(tile_type: int, is_red: bool = False) -> int:
@@ -135,7 +135,9 @@ class FeatureExtractor:
     
     def extract_scalar_features(self, state: GameState) -> np.ndarray:
         features = np.zeros(20, dtype=np.float32)
-        for i in range(4): features[i] = max(0, (state.scores[i] + 50000) / 100000.0)
+        for i in range(4):
+            abs_pos = (self.observer_idx + i) % 4
+            features[i] = max(0, (state.scores[abs_pos] + 50000) / 100000.0)
         
         used_tiles = sum(len(d) for d in state.discards)
         remaining_wall = 136 - used_tiles - sum(len(h) for h in state.hands)
@@ -353,7 +355,7 @@ def convert_mjson_directory(data_dir: str, output_dir: str, max_files: int = -1)
                 print(f"ERROR: {e}")
                 continue
         
-        # 【真正的釋放機制】將這一個 Batch 轉為 numpy，直接存入硬碟，然後徹底清空
+        # 直接輸出 dataset.py 可讀的 .npy 格式到 chunk 子目錄
         if batch_trajectories:
             features_list = [t['features'] for traj in batch_trajectories for t in traj]
             actions_list = [t['action'] for traj in batch_trajectories for t in traj]
@@ -362,22 +364,23 @@ def convert_mjson_directory(data_dir: str, output_dir: str, max_files: int = -1)
             # 將目前這個 chunk 的軌跡長度轉換為邊界索引
             boundaries = np.cumsum([len(t) for t in batch_trajectories])
             
-            # 定義這個 chunk 的輸出檔名
-            chunk_file = os.path.join(output_dir, f"converted_trajectories_chunk_{chunk_index:03d}.npz")
+            # 建立 chunk 子目錄，直接寫入獨立 .npy 檔案（dataset.py 直接可讀）
+            chunk_folder = os.path.join(output_dir, f"chunk_{chunk_index:03d}")
+            os.makedirs(chunk_folder, exist_ok=True)
             
-            # 直接存入硬碟
-            np.savez(
-                chunk_file,
-                features=np.array(features_list),
-                actions=np.array(actions_list),
-                rtgs=np.array(rtgs_list, dtype=np.float32).reshape(-1, 1),
-                trajectory_boundaries=boundaries
-            )
+            np.save(os.path.join(chunk_folder, "features.npy"),
+                    np.array(features_list, dtype=np.float32))
+            np.save(os.path.join(chunk_folder, "actions.npy"),
+                    np.array(actions_list, dtype=np.int64))
+            np.save(os.path.join(chunk_folder, "rtgs.npy"),
+                    np.array(rtgs_list, dtype=np.float32).reshape(-1, 1))
+            np.save(os.path.join(chunk_folder, "trajectory_boundaries.npy"),
+                    boundaries)
             
             steps_in_chunk = len(features_list)
             total_steps_all_chunks += steps_in_chunk
             
-            print(f"  ✅ Chunk {chunk_index} saved to: {os.path.basename(chunk_file)}")
+            print(f"  ✅ Chunk {chunk_index} saved to: {os.path.basename(chunk_folder)}/")
             print(f"     Steps in this chunk: {steps_in_chunk} | Total steps so far: {total_steps_all_chunks}")
             
             # 存完硬碟後，徹底刪除這些龐大的 List，讓 Python 進行 Garbage Collection
@@ -386,10 +389,12 @@ def convert_mjson_directory(data_dir: str, output_dir: str, max_files: int = -1)
             
     print(f"\n🎉 All done! Processed {len(mjson_files)} files into {chunk_index} chunks.")
     print(f"Total steps generated across all chunks: {total_steps_all_chunks}")
+    print(f"Output directory structure ready for dataset.py: {output_dir}/chunk_XXX/{{features,actions,rtgs,trajectory_boundaries}}.npy")
 
 if __name__ == "__main__":
     import sys
     data_dir = "/workspace/Mahjong/data/mjai/2024"
-    output_dir = "/workspace/Mahjong/converted_features"
+    output_dir = "/data/converted_features_npy"
     max_files = int(sys.argv[1]) if len(sys.argv) > 1 else -1  # -1 = all files, otherwise specify limit
+    print(f"Output directory: {output_dir} (SSD)")
     convert_mjson_directory(data_dir, output_dir, max_files)

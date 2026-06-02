@@ -151,74 +151,120 @@ std::vector<mjxproto::Event> Observation::EventHistory() const {
 
 
 std::vector<float> Observation::ToFeaturesDecisionMamba() const {
-    // 總維度: 空間特徵 (40 channels * 34 tiles) + 純量特徵 (20) = 1380 
+    // 總維度：空間特徵 (40 channels * 34 tiles = 1360) + 標量特徵 (20) = 1380
     std::vector<float> feature(1380, 0.0f);
-    int who = proto_.who();
+    int who = proto_.who(); // 觀察者（Agent）的絕對玩家 ID
 
-    // ==========================================
-    // 1. 空間特徵 (Spatial Channels) C=40 [Index 0 ~ 1359]
-    // ==========================================
-    // 輔助函式：將對應 channel 與 tile_type 的位置設為 1.0f
+    // 輔助 Lambda 函式：將對應 channel 與 tile_type 的一維索引位置設為 1.0f
     auto set_spatial = [&](int channel, int tile_type, float val = 1.0f) {
-        feature[channel * 34 + tile_type] = val;
+        if (channel >= 0 && channel < 40 && tile_type >= 0 && tile_type < 34) {
+            feature[channel * 34 + tile_type] = val;
+        }
     };
 
-    // [0-3] Own Hand (自己的手牌) 
-    std::vector<int> hand_counts(34, 0);
-    for (auto t : proto_.private_observation().curr_hand().closed_tiles()) {
-        int t_type = Tile(t).TypeUint();
-        if (hand_counts[t_type] < 4) {
-            set_spatial(0 + hand_counts[t_type], t_type);
-            hand_counts[t_type]++;
-        }
-    }
+    // ========================================================================
+    // 0. 狀態還原：重現 Python 腳本的歷史事件追蹤邏輯
+    // ========================================================================
+    std::vector<std::vector<int>> player_discards(4);           // 追蹤四家牌河
+    std::vector<std::vector<std::vector<int>>> player_melds(4); // 追蹤四家副露
+    std::vector<int> reach_status(4, 0);                       // 追蹤四家立直狀態
 
-    // [4-7] Own Melds (自己的鳴牌) 
-    int my_meld_idx = 0;
-    for (auto o : proto_.private_observation().curr_hand().opens()) {
-        if (my_meld_idx >= 4) break;
-        for (auto t : Open(o).Tiles()) {
-            set_spatial(4 + my_meld_idx, Tile(t).TypeUint());
-        }
-        my_meld_idx++;
-    }
-
-    // [8-19] Opponent Melds & [20-35] Discards (對手的鳴牌與所有人的牌河) 
-    // 透過解析 public_observation().events() 來還原盤面歷史
-    std::vector<int> meld_idx(4, 0);
-    meld_idx[who] = my_meld_idx; // 自己的 meld 已經處理過，從對手開始算
-    std::vector<std::vector<int>> discard_counts(4, std::vector<int>(34, 0));
+    int kyotaku = proto_.public_observation().init_score().riichi(); // 初始場上立直棒
+    int used_tiles = 0;          // 總捨牌次數 (對應 Python 腳本 used_tiles)
+    int hand_tiles_total = 52;   // 四家初始手牌總數 (13張 * 4人 = 52)
 
     for (const auto& event : proto_.public_observation().events()) {
-        int p = event.who();
-        int rel_p = (p - who + 4) % 4; // 相對位置 (0: 自己, 1: 下家, 2: 對家, 3: 上家)
+        int actor = event.who();
+        if (actor < 0 || actor >= 4) continue;
 
-        // 處理牌河 (捨牌與摸切)
-        if (event.type() == mjxproto::EVENT_TYPE_DISCARD ||
-            event.type() == mjxproto::EVENT_TYPE_TSUMOGIRI) {
-            int t_type = Tile(event.tile()).TypeUint();
-            if (discard_counts[rel_p][t_type] < 4) {
-                set_spatial(20 + rel_p * 4 + discard_counts[rel_p][t_type], t_type);
-                discard_counts[rel_p][t_type]++;
-            }
+        if (event.type() == mjxproto::EVENT_TYPE_DRAW) {
+            hand_tiles_total += 1; // 摸牌：場上手牌總數增加
         }
-        // 處理對手鳴牌 (吃、碰、各種槓)
-        else if (rel_p != 0 && (
-                 event.type() == mjxproto::EVENT_TYPE_CHI ||
-                 event.type() == mjxproto::EVENT_TYPE_PON ||
-                 event.type() == mjxproto::EVENT_TYPE_ADDED_KAN ||
-                 event.type() == mjxproto::EVENT_TYPE_OPEN_KAN ||
-                 event.type() == mjxproto::EVENT_TYPE_CLOSED_KAN)) {
-            if (meld_idx[rel_p] < 4) {
-                for (auto t : Open(event.open()).Tiles()) {
-                    set_spatial(8 + (rel_p - 1) * 4 + meld_idx[rel_p], Tile(t).TypeUint());
+        else if (event.type() == mjxproto::EVENT_TYPE_DISCARD || event.type() == mjxproto::EVENT_TYPE_TSUMOGIRI) {
+            int t_type = Tile(event.tile()).TypeUint();
+            player_discards[actor].push_back(t_type);
+            used_tiles += 1;
+            hand_tiles_total -= 1; // 切牌：手牌減少，牌河與已用牌增加
+        }
+        else if (event.type() == mjxproto::EVENT_TYPE_RIICHI) {
+            reach_status[actor] = 1;
+            kyotaku += 1; // 宣告立直：立直棒移至場中央
+        }
+        else if (event.type() == mjxproto::EVENT_TYPE_CHI || event.type() == mjxproto::EVENT_TYPE_PON ||
+                 event.type() == mjxproto::EVENT_TYPE_OPEN_KAN || event.type() == mjxproto::EVENT_TYPE_CLOSED_KAN ||
+                 event.type() == mjxproto::EVENT_TYPE_ADDED_KAN) {
+
+            std::vector<int> meld_tiles;
+            for (auto t : Open(event.open()).Tiles()) {
+                meld_tiles.push_back(Tile(t).TypeUint());
+            }
+            if (!meld_tiles.empty()) {
+                player_melds[actor].push_back(meld_tiles);
+
+                // 依據吃碰槓類型，精確扣減手牌在模擬計數中的張數
+                if (event.type() == mjxproto::EVENT_TYPE_CHI || event.type() == mjxproto::EVENT_TYPE_PON) {
+                    hand_tiles_total -= 2;
+                } else if (event.type() == mjxproto::EVENT_TYPE_OPEN_KAN) {
+                    hand_tiles_total -= 3;
+                } else if (event.type() == mjxproto::EVENT_TYPE_CLOSED_KAN) {
+                    hand_tiles_total -= 4;
+                } else if (event.type() == mjxproto::EVENT_TYPE_ADDED_KAN) {
+                    hand_tiles_total -= 1;
                 }
-                meld_idx[rel_p]++;
             }
         }
     }
 
-    // [36-39] Dora Indicators (寶牌指示牌) 
+    // ========================================================================
+    // 1. 空間特徵 (Spatial Channels) C=40 [Index 0 ~ 1359]
+    // ========================================================================
+
+    // [0-3] Own Hand：自家手牌溫度計編碼
+    std::vector<int> own_hand_counts(34, 0);
+    for (auto t : proto_.private_observation().curr_hand().closed_tiles()) {
+        int t_type = Tile(t).TypeUint();
+        if (own_hand_counts[t_type] < 4) {
+            set_spatial(0 + own_hand_counts[t_type], t_type);
+            own_hand_counts[t_type]++;
+        }
+    }
+
+    // [4-7] Own Melds：自家副露（最多 4 組）
+    for (size_t m_idx = 0; m_idx < std::min(player_melds[who].size(), size_t(4)); ++m_idx) {
+        for (int t_type : player_melds[who][m_idx]) {
+            set_spatial(4 + m_idx, t_type);
+        }
+    }
+
+    // [8-19] Opponent Melds：對手副露（相對位置：1下家, 2對家, 3上家）
+    for (int relative_pos = 1; relative_pos <= 3; ++relative_pos) {
+        int abs_pos = (who + relative_pos) % 4;
+        int channel_base = 8 + (relative_pos - 1) * 4;
+        for (size_t m_idx = 0; m_idx < std::min(player_melds[abs_pos].size(), size_t(4)); ++m_idx) {
+            for (int t_type : player_melds[abs_pos][m_idx]) {
+                set_spatial(channel_base + m_idx, t_type);
+            }
+        }
+    }
+
+    // [20-35] Discards：四家牌河分段時序（每 6 張切換一排通道）
+    // 修正 Bug 4: 改為時序分段，而非 tile-type 計數
+    for (int relative_pos = 0; relative_pos < 4; ++relative_pos) {
+        int abs_pos = (who + relative_pos) % 4;
+        const auto& discards = player_discards[abs_pos];
+
+        for (int group_idx = 0; group_idx < 4; ++group_idx) {
+            int channel_idx = 20 + relative_pos * 4 + group_idx;
+            int start_idx = group_idx * 6;
+            int end_idx = std::min(start_idx + 6, static_cast<int>(discards.size()));
+
+            for (int i = start_idx; i < end_idx; ++i) {
+                set_spatial(channel_idx, discards[i]);
+            }
+        }
+    }
+
+    // [36-39] Dora Indicators：寶牌指示牌（最多 4 張）
     int dora_idx = 0;
     for (auto t : proto_.public_observation().dora_indicators()) {
         if (dora_idx >= 4) break;
@@ -226,64 +272,56 @@ std::vector<float> Observation::ToFeaturesDecisionMamba() const {
         dora_idx++;
     }
 
-    // ==========================================
+    // ========================================================================
     // 2. 純量特徵 (Scalar Features) S=20 [Index 1360 ~ 1379]
-    // ==========================================
+    // ========================================================================
     int scalar_offset = 1360;
 
-    // [0-3] Scores (四家分數，除以 50000 進行正規化) 
+    // 修正 Bug 1: [0-3] Scores：四家分數，使用 (score + 50000) / 100000 歸一化
+    // 嚴格對齊相對方位 [0:自己, 1:下家, 2:對家, 3:上家]
     auto tens = proto_.public_observation().init_score().tens();
-    for(int i = 0; i < 4; ++i) {
-        int p = (who + i) % 4;
-        feature[scalar_offset + i] = tens[p] / 50000.0f;
+    for (int i = 0; i < 4; ++i) {
+        int abs_pos = (who + i) % 4;
+        feature[scalar_offset + i] = std::max(0.0f, (tens[abs_pos] + 50000) / 100000.0f);
     }
 
-    // [4] Wall Remainder (牌山剩餘張數，除以 70)
-    {
-        int num_draws = 0;
-        for (const auto& event : proto_.public_observation().events()) {
-            if (event.type() == mjxproto::EVENT_TYPE_DRAW) num_draws++;
-        }
-        // 牌山總可摸張數為 70 (122 - 52) 
-        feature[scalar_offset + 4] = (70 - num_draws) / 70.0f;
-    }
+    // [4] Remaining Wall Ratio：剩餘牆牌比例
+    int remaining_wall = 136 - used_tiles - hand_tiles_total;
+    feature[scalar_offset + 4] = std::max(0.0f, remaining_wall / 70.0f);
 
-    // [5-6] Prevalent Wind (場風，東風/南風 One-hot) 
+    // [5-6] Prevalent Wind：場風 One-hot (東風=1, 南風=1)
     int wind = proto_.public_observation().init_score().round() / 4;
-    if (wind == 0) feature[scalar_offset + 5] = 1.0f; // 東
-    if (wind == 1) feature[scalar_offset + 6] = 1.0f; // 南
+    if (wind == 0) feature[scalar_offset + 5] = 1.0f;
+    if (wind == 1) feature[scalar_offset + 6] = 1.0f;
 
-    // [7-10] Round Number (局數 1-4，One-hot) 
-    int round = proto_.public_observation().init_score().round() % 4; // 0 to 3
-    if (round >= 0 && round < 4) {
-        feature[scalar_offset + 7 + round] = 1.0f;
+    // [7-10] Round Number：局數 1-4 One-hot (東一局~東四局)
+    int round_idx = proto_.public_observation().init_score().round() % 4;
+    if (round_idx >= 0 && round_idx < 4) {
+        feature[scalar_offset + 7 + round_idx] = 1.0f;
     }
 
-    // [11-12] Honba / Reach sticks (本場數/立直棒，除以 5 與 4) 
-    feature[scalar_offset + 11] = proto_.public_observation().init_score().honba() / 5.0f;
-    feature[scalar_offset + 12] = proto_.public_observation().init_score().riichi() / 4.0f;
+    // 修正 Bug 2: [11] Honba：本場數歸一化（除 30，限制最大值為 1.0）
+    float honba_val = static_cast<float>(proto_.public_observation().init_score().honba()) / 30.0f;
+    feature[scalar_offset + 11] = std::min(honba_val, 1.0f);
 
-    // [13-16] Reach Status (四家立直狀態，相對位置) 
-    // 解析所有玩家的立直歷史
-    std::vector<bool> is_riichi(4, false);
-    for (const auto& event : proto_.public_observation().events()) {
-        if (event.type() == mjxproto::EVENT_TYPE_RIICHI) {
-            is_riichi[event.who()] = true;
-        }
-    }
-    for(int i = 0; i < 4; ++i) {
-        int p = (who + i) % 4;
-        if (is_riichi[p]) {
-            feature[scalar_offset + 13 + i] = 1.0f;
-        }
+    // [12] Kyotaku：場上立直棒數（包含局中動態累加，限制最大值為 1.0）
+    float kyotaku_val = static_cast<float>(kyotaku) / 4.0f;
+    feature[scalar_offset + 12] = std::min(kyotaku_val, 1.0f);
+
+    // [13-16] Reach Status：四家相對位置立直狀態
+    for (int i = 0; i < 4; ++i) {
+        int abs_pos = (who + i) % 4;
+        feature[scalar_offset + 13 + i] = static_cast<float>(reach_status[abs_pos]);
     }
 
-    // [17-19] Dealer Position (莊家位置，相對距離) 
+    // 修正 Bug 3: [17-19] Dealer Position：莊家相對位置 One-hot
+    // 17: 自家, 18: 下家, 19: 對家; 上家為莊家時 17-19 維持 0
     int dealer = proto_.public_observation().init_score().round() % 4;
-    int rel_dealer = (dealer - who + 4) % 4;
-    if (rel_dealer > 0) { // 如果自己是莊家 (rel_dealer == 0)，這三維維持 0
-        feature[scalar_offset + 17 + rel_dealer - 1] = 1.0f;
-    }
+    int relative_dealer = (dealer - who + 4) % 4;
+    if (relative_dealer == 0)      feature[scalar_offset + 17] = 1.0f; // 自己是莊家
+    else if (relative_dealer == 1) feature[scalar_offset + 18] = 1.0f; // 下家是莊家
+    else if (relative_dealer == 2) feature[scalar_offset + 19] = 1.0f; // 對家是莊家
+    // 備註：若 relative_dealer == 3 (上家是莊家)，17~19 維持預設值 0.0f
 
     return feature;
 }
