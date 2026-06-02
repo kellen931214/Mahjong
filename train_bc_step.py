@@ -44,10 +44,11 @@ def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1)):
     
     valid_mask = (target_action != -100).float()
     
-    # 計算 action accuracy
+    # 計算 action accuracy（排除 padding -100 與 none/跳過 179，後者本質是「非我回合」的空動作）
+    eval_mask = valid_mask * (target_action != 179).float()
     pred_actions = pred_action.argmax(dim=-1)
-    correct = ((pred_actions == target_action).float() * valid_mask).sum()
-    accuracy = correct / (valid_mask.sum() + 1e-8)
+    correct = ((pred_actions == target_action).float() * eval_mask).sum()
+    accuracy = correct / (eval_mask.sum() + 1e-8)
     
     # ================= 2. RTG 預測損失 =================
     rtg_diff = (pred_rtg.squeeze(-1) - rtg.squeeze(-1)) ** 2

@@ -78,7 +78,8 @@ class BehavioralCloningDataset(Dataset):
         
         # 限制最大序列長度
         max_len = 512
-        if length > max_len:
+        orig_length = length
+        if orig_length > max_len:
             start = end - max_len
             length = max_len
           
@@ -111,7 +112,9 @@ class BehavioralCloningDataset(Dataset):
         else:
             rtgs = torch.ones((length, 1), dtype=torch.float32)
           
-        timesteps = torch.arange(length, dtype=torch.long) 
+        # 修正：計算截斷後的真實起始時間步偏移（timestep truncation offset）
+        timestep_offset = orig_length - length if orig_length > max_len else 0
+        timesteps = torch.arange(timestep_offset, timestep_offset + length, dtype=torch.long) 
         
         return { 
             'state': states, 
