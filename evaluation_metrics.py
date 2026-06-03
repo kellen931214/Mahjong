@@ -213,7 +213,7 @@ class MahjongMetricTracker:
                 - "is_houjuu" (bool, optional): agent 是否放銃。
                   若未提供則預設為 False。
                 - "anyone_agari" (bool, optional): 本局是否有人胡牌。
-                  若未提供則從 is_agari 推估。
+                  若未提供則用 is_draw_game() 從 final_scores 反推。
         """
         self.total_games += 1
 
