@@ -30,6 +30,7 @@ from evaluation_metrics import (
     compute_offline_accuracy,
     compute_detailed_accuracy,
     MahjongMetricTracker,
+    StreamingAccuracyTracker,
     is_draw_game,
 )
 
@@ -150,9 +151,9 @@ def run_offline_eval_from_dataset(args):
     model.eval()
     print(f"   模型參數數: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── 3. 逐 batch 推論，收集 logits / targets ──
-    all_logits = []
-    all_targets = []
+    # ── 3. 逐 batch 推論，流式計數（O(1) 記憶體，避免 OOM）──
+    tracker = StreamingAccuracyTracker()
+    total_valid_samples = 0
 
     print(f"\n🚀 開始推論 ({len(val_loader)} batches)...")
     with torch.no_grad():
@@ -160,7 +161,7 @@ def run_offline_eval_from_dataset(args):
             rtg = batch["rtg"].to(device)
             state = batch["state"].to(device)
             input_action = batch["input_action"].to(device)
-            target_action = batch["target_action"].to(device)
+            target_action = batch["target_action"]  # 保留在 CPU
             timesteps = batch["timesteps"].to(device)
 
             pred_action, _, _, _ = model(
@@ -168,31 +169,54 @@ def run_offline_eval_from_dataset(args):
             )
             # pred_action: (B, T, 181), target_action: (B, T)
 
+            # 提取有效樣本（過濾 padding / NO / DUMMY）
             B, T = target_action.shape
+            batch_logits = []
+            batch_targets = []
+
             for b in range(B):
                 for t in range(T):
                     tid = target_action[b, t].item()
-                    # 跳過 padding (-100)、NO(179)、DUMMY(180)
                     if tid < 0 or tid in (179, 180):
                         continue
-                    all_logits.append(pred_action[b, t].cpu())
-                    all_targets.append(tid)
+                    batch_logits.append(pred_action[b, t])
+                    batch_targets.append(tid)
+
+            if len(batch_targets) == 0:
+                continue
+
+            # 🔥 關鍵：per-batch 立即計數，不保留 tensor
+            batch_logits_t = torch.stack(batch_logits)  # 最多 B*T 個，記憶體可控
+            batch_targets_t = torch.tensor(batch_targets, dtype=torch.long, device=device)
+            tracker.update(batch_logits_t, batch_targets_t)
+            total_valid_samples += len(batch_targets)
+
+            # 🔥 立即釋放本 batch 的 GPU/CPU tensor
+            del batch_logits, batch_targets, batch_logits_t, batch_targets_t
 
             if (batch_idx + 1) % max(1, len(val_loader) // 10) == 0:
                 print(f"  進度: {batch_idx + 1}/{len(val_loader)} batches, "
-                      f"已收集 {len(all_targets)} 有效樣本")
+                      f"已處理 {total_valid_samples} 有效樣本")
 
-    print(f"\n  推論完成，共收集 {len(all_targets)} 個有效動作樣本")
+    print(f"\n  推論完成，共處理 {total_valid_samples} 個有效動作樣本")
 
-    if len(all_targets) == 0:
+    if total_valid_samples == 0:
         print("[錯誤] 沒有有效樣本可供評估")
         sys.exit(1)
 
-    logits_t = torch.stack(all_logits)  # (N, 181)
-    targets_t = torch.tensor(all_targets, dtype=torch.long)  # (N,)
-
-    # ── 4. 計算準確率 ──
-    _print_accuracy_results(logits_t, targets_t, mask=None, top_k=args.top_k)
+    # ── 4. 計算準確率（從流式計數器直接相除）──
+    acc_results = tracker.compute()
+    print()
+    print("  類別準確率:")
+    print(f"    總體準確率 (Overall) : {acc_results.get('overall_accuracy', 0)*100:.2f}%")
+    for cat in ["dahai", "chow", "pong", "kong", "riichi"]:
+        key = f"{cat}_accuracy"
+        val = acc_results.get(key, float("nan"))
+        if np.isnan(val):
+            print(f"    {cat:>8s} 準確率 : N/A (無此類別樣本)")
+        else:
+            print(f"    {cat:>8s} 準確率 : {val*100:.2f}%")
+    print("=" * 60)
 
 
 def _print_accuracy_results(logits, targets, mask, top_k=False):

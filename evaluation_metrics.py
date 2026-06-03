@@ -164,6 +164,121 @@ def compute_detailed_accuracy(
 
 
 # ============================================================================
+#  1.5 流式準確率追蹤器 (O(1) 記憶體，避免 OOM)
+# ============================================================================
+
+class StreamingAccuracyTracker:
+    """
+    Per-batch 流式累加計數器：不保留任何大張量，只存純量 correct/total。
+
+    適用於超大驗證集（數千萬樣本）場景，記憶體複雜度 O(1)，避免 torch.cat()
+    時因同時持有分散碎片 + 連續分配空間而觸發 OOM Killer。
+
+    使用方式:
+        tracker = StreamingAccuracyTracker()
+        for batch in val_loader:
+            logits = model(state, action, ...)
+            targets = batch["target_action"]
+            # 過濾 padding / NO / DUMMY 後
+            tracker.update(logits, targets)
+        results = tracker.compute()  # 回傳與 compute_offline_accuracy 相同格式
+    """
+
+    def __init__(self, categories: Optional[List[str]] = None):
+        """
+        Args:
+            categories: 要追蹤的類別列表。預設為 EVAL_CATEGORIES。
+        """
+        cats = categories or list(EVAL_CATEGORIES)
+        self.categories = cats
+        self.reset()
+
+    def reset(self):
+        """重置所有計數器。"""
+        self._counters = {}
+        for cat in self.categories:
+            self._counters[cat] = {"correct": 0, "total": 0}
+        self._counters["overall"] = {"correct": 0, "total": 0}
+        self._total_samples = 0
+
+    @torch.no_grad()
+    def update(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        對單一 batch 計算預測結果，並按類別累加 correct / total。
+
+        Args:
+            logits: (B, 181) 模型原始 logits
+            targets: (B,) 真實標籤，0~180，不得含 padding (-100) / NO / DUMMY
+            mask: (B, 181) bool 合法動作遮罩。若 None 則全部合法。
+        """
+        B = logits.size(0)
+        if B == 0:
+            return
+
+        device = logits.device
+
+        # 合法動作遮罩
+        if mask is not None and mask.shape == logits.shape:
+            legal_bool = mask.bool()
+        else:
+            legal_bool = torch.ones_like(logits, dtype=torch.bool, device=device)
+
+        # argmax 預測
+        masked_logits = logits.clone()
+        masked_logits[~legal_bool] = float("-inf")
+        predictions = masked_logits.argmax(dim=-1)  # (B,)
+
+        has_legal = legal_bool.any(dim=-1)
+        correct = (predictions == targets) & has_legal
+
+        # 總體
+        self._counters["overall"]["correct"] += correct.sum().item()
+        self._counters["overall"]["total"] += has_legal.sum().item()
+        self._total_samples += B
+
+        # 各類別
+        for cat in self.categories:
+            lo, hi = ACTION_BINS[cat]
+            in_cat = (targets >= lo) & (targets <= hi)
+            cat_legal = legal_bool[:, lo:hi + 1].any(dim=-1)
+            valid = in_cat & cat_legal
+
+            if valid.sum().item() > 0:
+                cat_correct = (predictions == targets) & valid
+                self._counters[cat]["correct"] += cat_correct.sum().item()
+                self._counters[cat]["total"] += valid.sum().item()
+
+    def compute(self) -> Dict[str, float]:
+        """
+        從累加的計數器計算最終準確率。
+
+        Returns:
+            dict: 與 compute_offline_accuracy 相同格式的準確率字典
+        """
+        results = {}
+        for cat in ["overall"] + self.categories:
+            c = self._counters[cat]["correct"]
+            t = self._counters[cat]["total"]
+            if t == 0:
+                results[f"{cat}_accuracy" if cat != "overall" else "overall_accuracy"] = float("nan")
+            else:
+                results[f"{cat}_accuracy" if cat != "overall" else "overall_accuracy"] = c / t
+        return results
+
+    def summary(self) -> Dict:
+        """回傳完整計數摘要（含原始 correct/total 數值）。"""
+        return {
+            cat: dict(self._counters[cat])
+            for cat in ["overall"] + self.categories
+        }
+
+
+# ============================================================================
 #  2. 線上對局統計器 (Online Tracker)
 # ============================================================================
 
