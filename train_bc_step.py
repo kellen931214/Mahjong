@@ -1,9 +1,18 @@
 import torch
 import torch.nn.functional as F
 
-def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1)):
+def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1),
+                  loss_mode="ce", focal_loss=None):
     """
     BC 訓練/驗證步驟 - 計算多任務損失（嚴格因果對齊版）
+
+    Args:
+        model      : DecisionMamba / DecisionMambaMultiHead 模型
+        batch      : DataLoader 批次字典（含 rtg, state, target_action, input_action, timesteps）
+        optimizer  : PyTorch optimizer（傳入 None 表示驗證模式，不執行 backward）
+        lambdas    : (l1, l2, l3) 多任務損失權重，預設 (0.6, 0.3, 0.1)
+        loss_mode  : str, "ce"（預設，標準 CrossEntropy）或 "focal"（MahjongFocalLoss）
+        focal_loss : MahjongFocalLoss 實例（loss_mode="focal" 時必須傳入）
     """
     if optimizer is not None:
         model.train()
@@ -19,7 +28,7 @@ def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1)):
     input_action = batch["input_action"].to(device)   # 已在 bc_collate_fn 完成自迴歸右移
     timesteps = batch["timesteps"].to(device)   
     
-
+ 
 
     pred_action, pred_rtg, pred_state, _ = model(
         rtg=rtg, 
@@ -31,11 +40,18 @@ def train_bc_step(model, batch, optimizer=None, lambdas=(0.6, 0.3, 0.1)):
     # ================= 1. 動作預測損失 =================
     action_dim = pred_action.shape[-1]
     
-    ce_loss = F.cross_entropy(
-        pred_action.reshape(-1, action_dim), 
-        target_action.reshape(-1), 
-        ignore_index=-100
-    )
+    if loss_mode == "focal" and focal_loss is not None:
+        # ── Focal Loss 模式：使用 MahjongFocalLoss，內部自動展平與 mask ──
+        # focal_loss.forward(logits=(B,T,181), targets=(B,T)) 內部處理：
+        #   reshape → log_softmax → gather p_t → (1-p_t)^γ → α_t → mask → reduce
+        ce_loss = focal_loss(pred_action, target_action)
+    else:
+        # ── 標準 CE 模式（預設，向後相容）──
+        ce_loss = F.cross_entropy(
+            pred_action.reshape(-1, action_dim), 
+            target_action.reshape(-1), 
+            ignore_index=-100
+        )
     
     valid_mask = (target_action != -100).float()
     

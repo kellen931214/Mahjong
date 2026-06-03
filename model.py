@@ -120,3 +120,63 @@ class DecisionMamba(nn.Module):
         h = self.block(h0)
         
         return self.head_action(h), self.head_rtg(h), self.head_state(h), h
+
+
+class MahjongMultiHeadOutput(nn.Module):
+    """
+    多頭注意力分權輸出層 —— 評審團拼接機制（Jury Concatenation）
+
+    將原本單一的 nn.Linear(512, 181) 替換為五個專職的線性預測頭，
+    對同一個 Mamba 隱狀態（hidden state）同時進行並行計算，
+    最後在 dim=-1 首尾拼接（torch.cat）還原為精確的 181 維向量。
+
+    拆分依據（來自 mjx/include/internal/action.cpp Encode 函數）：
+      - Discard Head : 0~73   (74 dims)  ─ DISCARD + TSUMOGIRI
+      - Chow Head    : 74~103 (30 dims)  ─ CHI（含赤牌變體）
+      - Pong Head    : 104~140(37 dims)  ─ PON（含赤牌變體）
+      - Kong Head    : 141~174(34 dims)  ─ CLOSED/OPEN/ADDED KAN
+      - Special Head : 175~180(6 dims)   ─ TSUMO/RON/RIICHI/NINE_TERMINALS/NO/DUMMY
+    """
+
+    def __init__(self, d_model: int = 512):
+        super().__init__()
+        # 五個專職 Linear Heads
+        self.head_discard = nn.Linear(d_model, 74)   # 切牌
+        self.head_chow    = nn.Linear(d_model, 30)   # 吃
+        self.head_pong    = nn.Linear(d_model, 37)   # 碰
+        self.head_kong    = nn.Linear(d_model, 34)   # 槓
+        self.head_special = nn.Linear(d_model, 6)    # 特殊動作
+
+    def forward(self, x):
+        """
+        Args:
+            x: Mamba backbone 輸出的隱狀態，shape (B, T, d_model)
+
+        Returns:
+            logits: 拼接後的完整動作分數，shape (B, T, 181)
+        """
+        discard = self.head_discard(x)   # (B, T, 74)
+        chow    = self.head_chow(x)      # (B, T, 30)
+        pong    = self.head_pong(x)      # (B, T, 37)
+        kong    = self.head_kong(x)      # (B, T, 34)
+        special = self.head_special(x)   # (B, T, 6)
+
+        return torch.cat([discard, chow, pong, kong, special], dim=-1)  # (B, T, 181)
+
+
+class DecisionMambaMultiHead(DecisionMamba):
+    """
+    Decision Mamba 多頭分權版本
+
+    繼承原有的 DecisionMamba 骨幹（embedding / MultiGrainedBlock / Head RTG / Head State），
+    僅將 head_action 從單一 nn.Linear(512, 181) 替換為 MahjongMultiHeadOutput。
+
+    forward() 介面完全相容，無需修改任何下游訓練/推論程式碼。
+    """
+
+    def __init__(self, d_model=512, action_dim=181, state_dim=1380, max_ep_len=2048):
+        # 先呼叫父類別 __init__ 建立完整骨幹（含舊的 head_action 線性層）
+        super().__init__(d_model=d_model, action_dim=action_dim,
+                         state_dim=state_dim, max_ep_len=max_ep_len)
+        # 覆蓋 head_action 為多頭輸出層
+        self.head_action = MahjongMultiHeadOutput(d_model)

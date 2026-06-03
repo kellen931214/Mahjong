@@ -39,3 +39,4 @@ train_bc.log
 miniconda.sh
 train_ppo_v4.log
 download.log
+*.log

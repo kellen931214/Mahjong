@@ -94,7 +94,7 @@ def run_offline_eval_from_dataset(args):
     (val_split=0.2, seed=42) 取出驗證集，逐 batch 跑推論後計算各類別準確率。
     """
     from dataset import BehavioralCloningDataset, bc_collate_fn
-    from model import DecisionMamba
+    from model import DecisionMamba, DecisionMambaMultiHead
 
     device = args.device if torch.cuda.is_available() else "cpu"
     if device != args.device:
@@ -136,9 +136,8 @@ def run_offline_eval_from_dataset(args):
         pin_memory=True,
     )
 
-    # ── 2. 載入模型 ──
+    # ── 2. 載入模型（自動偵測單頭 vs 多頭 checkpoint）──
     print(f"\n🔧 載入模型: {args.checkpoint}")
-    model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         print(f"[錯誤] checkpoint 不存在: {checkpoint_path}")
@@ -146,6 +145,16 @@ def run_offline_eval_from_dataset(args):
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    # 🔍 自動偵測：checkpoint 中含 head_action.head_discard.weight 表示為多頭架構
+    is_multihead = any(k.startswith("head_action.head_") for k in state_dict.keys())
+    if is_multihead:
+        print(f"   🧠 偵測到多頭架構 checkpoint → 使用 DecisionMambaMultiHead")
+        model = DecisionMambaMultiHead(d_model=512, action_dim=181, state_dim=1380)
+    else:
+        print(f"   🧠 偵測到單頭架構 checkpoint → 使用 DecisionMamba")
+        model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
+
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
@@ -302,15 +311,14 @@ def run_selfplay_eval(args):
 
     # 延遲導入（避免無 mjx 環境時直接報錯）
     from runner import SelfPlayRunner
-    from model import DecisionMamba
+    from model import DecisionMamba, DecisionMambaMultiHead
 
     device = args.device if torch.cuda.is_available() else "cpu"
     if device != args.device:
         print(f"[警告] CUDA 不可用，使用 {device}")
 
-    # 建立模型
+    # 🔍 建立模型（自動偵測單頭 vs 多頭 checkpoint）
     print(f"\n  載入模型: {args.checkpoint}")
-    model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         print(f"[錯誤] checkpoint 不存在: {checkpoint_path}")
@@ -318,6 +326,15 @@ def run_selfplay_eval(args):
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    is_multihead = any(k.startswith("head_action.head_") for k in state_dict.keys())
+    if is_multihead:
+        print(f"  🧠 偵測到多頭架構 checkpoint → 使用 DecisionMambaMultiHead")
+        model = DecisionMambaMultiHead(d_model=512, action_dim=181, state_dim=1380)
+    else:
+        print(f"  🧠 偵測到單頭架構 checkpoint → 使用 DecisionMamba")
+        model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
+
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
