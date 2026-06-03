@@ -233,9 +233,10 @@ class MahjongMetricTracker:
         # 和局 vs 有人胡牌
         anyone_agari = game_result.get("anyone_agari", None)
         if anyone_agari is None:
-            # 推估：如果 agent 沒有胡牌且排名全是同分可能為和局
-            # 更穩健的做法：從 final_scores 判斷有沒有人分數顯著增加
-            anyone_agari = game_result.get("is_agari", False)
+            # 🚀【修正】不能 fallback 到 is_agari：若對手胡牌但 agent 沒胡，
+            # is_agari=False 會把「有人胡牌」誤判為和局，造成 draw_games 被放大 3~4 倍。
+            # 正確做法：用 is_draw_game() 從 final_scores 反推是否為和局。
+            anyone_agari = not is_draw_game(game_result)
 
         if anyone_agari:
             self.agari_games += 1
