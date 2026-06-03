@@ -16,7 +16,7 @@ NEG_INF = -1e9
 
 
 class SelfPlayRunner:
-    def __init__(self, model, device: str = "cuda", opponent_pool_size: int = 5, train_mode: str = "attack", opponent_base_model=None):
+    def __init__(self, model, device: str = "cuda", opponent_pool_size: int = 5, train_mode: str = "attack", opponent_base_model=None, external_agents=None):
         """
         初始化自我博弈環境與對手池
 
@@ -28,6 +28,9 @@ class SelfPlayRunner:
             opponent_base_model:   對手基底模型（選填）。若提供，對手池以此模型為基底；
                                    若為 None，對手池以 self.model 的複本為基底（自我對弈）。
                                    用於 PPO vs BC 對比評估：agent 用 model，對手用 BC baseline。
+            external_agents:       選填。dict[pid] = agent_object，用於注入外部 AI（如 MortalAgent）。
+                                   agent 物件必須實作 act(obs) → mjx.Action 和 reset() 方法。
+                                   當 player pid 有對應的外部 agent 時，使用外部 agent 而非 DecisionMamba 推論。
         """
         if train_mode not in ("attack", "defense"):
             raise ValueError(f"train_mode 必須是 'attack' 或 'defense'，收到: {train_mode}")
@@ -42,6 +45,8 @@ class SelfPlayRunner:
         self.reward_calculator = create_default_calculator()
         # 全程固定模式，不需要動態切換
         self.reward_calculator.set_mode(train_mode)
+        # 🆕 外部 agent 對照表（如 MortalAgent）
+        self.external_agents = external_agents or {}
 
     def update_opponent_pool(self):
         """
@@ -80,17 +85,26 @@ class SelfPlayRunner:
                 game_result 新增 "hand_results" (List[Dict]) 和 "total_hands" (int)
         """
         obs_dict = self.env.reset()
+
+        # 🆕 重置外部 agent 狀態（如 MortalAgent）
+        for pid, ext_agent in self.external_agents.items():
+            if hasattr(ext_agent, 'reset'):
+                ext_agent.reset()
+
         agent_pid = random.choice([0, 1, 2, 3])
         agent_key = f"player_{agent_pid}"
 
-        assigned_models = {
-            agent_pid: self.model,
-            **{
-                pid: random.choice(self.opponent_pool)
-                for pid in [0, 1, 2, 3]
-                if pid != agent_pid
-            },
-        }
+        # 🆕 決定每位玩家使用 DecisionMamba 還是外部 agent
+        # external_agents 優先：若外部 agent 存在則使用它，否則用 DecisionMamba
+        # agent_pid（我們訓練的模型）永遠使用 self.model（PPO agent）
+        assigned_models = {}
+        for pid in range(4):
+            if pid == agent_pid:
+                assigned_models[pid] = ("mamba", self.model)
+            elif pid in self.external_agents:
+                assigned_models[pid] = ("external", self.external_agents[pid])
+            else:
+                assigned_models[pid] = ("mamba", random.choice(self.opponent_pool))
 
         trajectories = {agent_pid: []}
         obs_histories = {pid: [] for pid in range(4)}
@@ -170,45 +184,62 @@ class SelfPlayRunner:
             ]
 
             # ── 模型推論 ──
-            with torch.no_grad():
-                actor_logits, _, _, _ = assigned_models[current_pid](
-                    seq_rtg, seq_state, seq_act, seq_time
-                )
-                logits = actor_logits[:, -1, :].squeeze(0)
+            agent_type, agent_model = assigned_models[current_pid]
 
-                legal_mask_bool = torch.zeros_like(
-                    logits, dtype=torch.bool, device=self.device
-                )
+            if agent_type == "external":
+                # 🆕 使用外部 agent（如 MortalAgent）進行決策
+                mjx_action = agent_model.act(obs)
+                action_idx = mjx_action.to_idx() if hasattr(mjx_action, "to_idx") else 0
 
-                if len(legal_indices) > 0:
-                    mask = torch.full_like(
-                        logits, NEG_INF, dtype=torch.float32, device=self.device
+                # 簡化：外部 agent 的 log_prob / probs 設為均勻分佈
+                # 因為我們不需要對 extern agent 收集訓練軌跡
+                probs = torch.ones(len(legal_indices), device=self.device) / len(legal_indices)
+                legal_mask_bool = torch.zeros(181, dtype=torch.bool, device=self.device)
+                for idx in legal_indices:
+                    if 0 <= idx < 181:
+                        legal_mask_bool[idx] = True
+
+            else:
+                # 🧠 使用 DecisionMamba 模型推論（原有邏輯不變）
+                with torch.no_grad():
+                    actor_logits, _, _, _ = agent_model(
+                        seq_rtg, seq_state, seq_act, seq_time
                     )
-                    for idx in legal_indices:
-                        if 0 <= idx < len(mask):
-                            mask[idx] = logits[idx]
-                            legal_mask_bool[idx] = True
-                    probs = F.softmax(mask / temperature, dim=-1)
-                else:
-                    probs = torch.ones_like(logits) / len(logits)
+                    logits = actor_logits[:, -1, :].squeeze(0)
 
-                if torch.isnan(probs).any() or torch.isinf(probs).any():
-                    probs = (
-                        torch.ones(len(legal_indices), device=self.device)
-                        / len(legal_indices)
+                    legal_mask_bool = torch.zeros_like(
+                        logits, dtype=torch.bool, device=self.device
                     )
 
-            action_idx = torch.multinomial(probs, 1).item()
-            mjx_action = None
-            for a in legal_actions:
-                if hasattr(a, "to_idx") and a.to_idx() == action_idx:
-                    mjx_action = a
-                    break
-            if mjx_action is None:
-                print(
-                    f"⚠️ 警告：action_idx {action_idx} 無法對應到任何合法動作，fallback 至 legal_actions[0]"
-                )
-                mjx_action = legal_actions[0]
+                    if len(legal_indices) > 0:
+                        mask = torch.full_like(
+                            logits, NEG_INF, dtype=torch.float32, device=self.device
+                        )
+                        for idx in legal_indices:
+                            if 0 <= idx < len(mask):
+                                mask[idx] = logits[idx]
+                                legal_mask_bool[idx] = True
+                        probs = F.softmax(mask / temperature, dim=-1)
+                    else:
+                        probs = torch.ones_like(logits) / len(logits)
+
+                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                        probs = (
+                            torch.ones(len(legal_indices), device=self.device)
+                            / len(legal_indices)
+                        )
+
+                action_idx = torch.multinomial(probs, 1).item()
+                mjx_action = None
+                for a in legal_actions:
+                    if hasattr(a, "to_idx") and a.to_idx() == action_idx:
+                        mjx_action = a
+                        break
+                if mjx_action is None:
+                    print(
+                        f"⚠️ 警告：action_idx {action_idx} 無法對應到任何合法動作，fallback 至 legal_actions[0]"
+                    )
+                    mjx_action = legal_actions[0]
 
             obs_histories[current_pid].append(state_tensor)
             timesteps_histories[current_pid].append(step_counts[current_pid])

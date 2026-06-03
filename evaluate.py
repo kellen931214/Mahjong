@@ -345,8 +345,28 @@ def run_selfplay_eval(args):
     if args.baseline_checkpoint:
         opponent_base_model = _load_model(args.baseline_checkpoint, "Opponent (BC)")
         print(f"  🆚 PPO vs BC 對比模式：agent=PPO，對手=BC baseline")
+    elif args.mortal_weights:
+        print(f"  🆚 PPO vs Mortal 對比模式：agent=PPO，對手=Mortal")
     else:
         print(f"  🎮 自我對弈模式：所有玩家用同一模型")
+
+    # 🆕 初始化外部 agents（Mortal 對比模式）
+    external_agents = {}
+    if args.mortal_weights:
+        from utli.mortal_agent import MortalAgent
+        mortal_ids = [int(x.strip()) for x in args.mortal_player_ids.split(",")]
+        for pid in mortal_ids:
+            if pid == 0:
+                print(f"  ⚠️ 警告：Mortal agent 不可設為 player_0（agent 保留位），已跳過")
+                continue
+            print(f"  🤖 建立 MortalAgent (pid={pid}): {args.mortal_weights}")
+            mortal_agent = MortalAgent(
+                weights_path=args.mortal_weights,
+                player_id=pid,
+                device=args.mortal_device,
+            )
+            external_agents[pid] = mortal_agent
+        print(f"  📋 外部 agent 配置: {list(external_agents.keys())}")
 
     # 建立 Runner 與 Tracker
     eval_mode = getattr(args, "eval_mode", "attack")
@@ -357,6 +377,7 @@ def run_selfplay_eval(args):
         opponent_pool_size=args.opponent_pool,
         train_mode=eval_mode,
         opponent_base_model=opponent_base_model,
+        external_agents=external_agents if external_agents else None,
     )
     tracker = MahjongMetricTracker()
 
@@ -476,6 +497,12 @@ def main():
                         help="[selfplay] 評估模式：attack=使用進攻 reward, defense=使用防守 reward")
     parser.add_argument("--baseline-checkpoint", type=str, default=None,
                         help="[selfplay] BC 基線模型 checkpoint（用於 PPO vs BC 對比評估）")
+    parser.add_argument("--mortal-weights", type=str, default=None,
+                        help="[selfplay] Mortal 權重檔路徑（.pth），用於 PPO vs Mortal 對比評估")
+    parser.add_argument("--mortal-device", type=str, default="cuda",
+                        help="[selfplay] Mortal 推理裝置（預設 cuda）")
+    parser.add_argument("--mortal-player-ids", type=str, default="1,2,3",
+                        help="[selfplay] Mortal agent 佔據的玩家 ID，逗號分隔（預設 1,2,3，agent 必為 0）")
 
     args = parser.parse_args()
 
