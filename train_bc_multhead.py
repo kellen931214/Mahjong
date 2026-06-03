@@ -3,8 +3,16 @@
 
 載入 BC 預訓練權重 → 替換為多頭輸出層 → 凍結骨幹 → 僅訓練五個專職 Linear Heads
 
+支援 --loss-mode ce | focal 自由切換損失函數
+
 用法：
+    # 標準 CrossEntropy（預設，向後相容）
     python train_bc_multhead.py --pretrained checkpoints/bc_model/best_bc_model.pt
+
+    # Focal Loss（γ=2.0, Kong=3.0×）
+    python train_bc_multhead.py --pretrained checkpoints/bc_model/best_bc_model.pt \
+        --loss-mode focal --focal-gamma 2.0 --kong-weight 3.0 \
+        --checkpoint-dir /my/checkpoints/focal_finetune
 """
 
 import torch
@@ -20,6 +28,7 @@ import argparse
 from dataset import BehavioralCloningDataset, bc_collate_fn
 from model import DecisionMambaMultiHead
 from train_bc_step import train_bc_step
+from utli.focal_loss import MahjongFocalLoss, build_default_alpha_weights
 
 
 # ==================== 微調初始化（Setup） ====================
@@ -33,6 +42,9 @@ def setup_multihead_finetune(
     finetune_lr: float = 5e-4,
     weight_decay: float = 1e-4,
     device: str = "cuda",
+    loss_mode: str = "ce",
+    focal_gamma: float = 2.0,
+    kong_weight: float = 3.0,
 ):
     """
     兩階段微調初始化邏輯：
@@ -41,6 +53,7 @@ def setup_multihead_finetune(
     2. 載入舊有的 BC 預訓練權重（strict=False，自動忽略舊的單一 Linear 輸出層）
     3. 凍結所有 Mamba 骨幹參數（Backbone Freezing）
     4. 僅將多頭輸出層（五個 Linear Heads）送入 AdamW 優化器
+    5. 可選建立 Focal Loss（loss_mode="focal"）
 
     Args:
         pretrained_path: 舊 BC 預訓練權重檔案路徑（best_bc_model.pt）
@@ -51,10 +64,14 @@ def setup_multihead_finetune(
         finetune_lr: 微調專用學習率（預設 5e-4）
         weight_decay: 權重衰減
         device: 計算設備
+        loss_mode: 損失模式 "ce" 或 "focal"（預設 "ce"）
+        focal_gamma: Focal Loss 聚焦指數 γ（loss_mode="focal" 時生效）
+        kong_weight: Kong 區間 alpha 加權倍率（loss_mode="focal" 時生效）
 
     Returns:
         model: 初始化完成的多頭模型
         optimizer: 僅包含多頭參數的 AdamW 優化器
+        focal_loss: MahjongFocalLoss 實例（loss_mode="ce" 時為 None）
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
 
@@ -155,12 +172,22 @@ def setup_multihead_finetune(
     )
     print(f"   ✅ 過濾驗證通過")
 
+    # ========== Step 5: Focal Loss 初始化（可選） ==========
+    focal_loss = None
+    if loss_mode == "focal":
+        print(f"\n🎯 初始化 Focal Loss（γ={focal_gamma}, kong_weight={kong_weight}×）...")
+        alpha = build_default_alpha_weights(kong_weight=kong_weight)
+        focal_loss = MahjongFocalLoss(alpha_weights=alpha, gamma=focal_gamma)
+        print(f"   ✅ MahjongFocalLoss 已建立")
+    else:
+        print(f"\n📐 使用標準 CrossEntropyLoss（loss_mode='ce'）")
+
     # ========== 模型移至設備 ==========
     model = model.to(device)
     print(f"\n🚀 模型已移至 {device}")
     print("=" * 70 + "\n")
 
-    return model, optimizer
+    return model, optimizer, focal_loss
 
 
 # ==================== 微調訓練函數 ====================
@@ -173,6 +200,8 @@ def train_multhead_finetune(
     num_epochs: int = 30,
     device: str = "cuda",
     checkpoint_dir: str = "/workspace/Mahjong/checkpoints/bc_multhead",
+    loss_mode: str = "ce",
+    focal_loss: nn.Module = None,
 ):
     """
     多頭分權微調訓練迴圈
@@ -191,7 +220,7 @@ def train_multhead_finetune(
     best_val_acc = 0.0
 
     print(f"\n{'=' * 70}")
-    print(f"🔥 開始多頭分權微調 | 設備: {device} | 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🔥 開始多頭分權微調 | 設備: {device} | Loss: {loss_mode} | 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 70}\n")
 
     for epoch in range(1, num_epochs + 1):
@@ -202,7 +231,10 @@ def train_multhead_finetune(
         train_steps = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            loss, metrics = train_bc_step(model, batch, optimizer)
+            loss, metrics = train_bc_step(
+                model, batch, optimizer,
+                loss_mode=loss_mode, focal_loss=focal_loss,
+            )
 
             train_loss += loss
             for key in train_metrics:
@@ -229,7 +261,10 @@ def train_multhead_finetune(
 
         with torch.no_grad():
             for batch in val_loader:
-                loss, metrics = train_bc_step(model, batch, optimizer=None)
+                loss, metrics = train_bc_step(
+                    model, batch, optimizer=None,
+                    loss_mode=loss_mode, focal_loss=focal_loss,
+                )
                 val_loss += loss
                 for key in val_metrics:
                     val_metrics[key] += metrics[key]
@@ -294,34 +329,22 @@ def train_multhead_finetune(
 
 def main():
     parser = argparse.ArgumentParser(description="多頭分權 BC 微調腳本")
-    parser.add_argument(
-        "--pretrained",
-        type=str,
-        default="/workspace/Mahjong/checkpoints/bc_model_one_head/best_bc_model.pt",
-        help="舊 BC 預訓練權重檔案路徑",
-    )
-    parser.add_argument(
-        "--npz-file",
-        type=str,
-        default="/data/converted_features_npy",
-        help="轉換後的特徵文件路徑",
-    )
-    parser.add_argument("--batch-size", type=int, default=256, help="批次大小")
-    parser.add_argument("--num-epochs", type=int, default=30, help="微調輪數")
-    parser.add_argument("--learning-rate", type=float, default=5e-4, help="微調學習率")
-    parser.add_argument("--val-split", type=float, default=0.2, help="驗證集比例")
-    parser.add_argument("--device", type=str, default="cuda", help="計算設備")
-    parser.add_argument("--seed", type=int, default=42, help="隨機種子")
-    parser.add_argument("--d-model", type=int, default=512, help="隱層維度")
-    parser.add_argument(
-        "--num-workers", type=int, default=4, help="DataLoader worker 數量"
-    )
-    parser.add_argument(
-        "--prefetch-factor", type=int, default=2, help="每個 worker 預先載入的 batch 數量"
-    )
-    parser.add_argument(
-        "--max-samples", type=int, default=None, help="限制使用的總軌跡數量（快速測試用）"
-    )
+    parser.add_argument('--pretrained', type=str, default='/workspace/Mahjong/checkpoints/bc_model_one_head/best_bc_model.pt', help='舊 BC 預訓練權重檔案路徑')
+    parser.add_argument('--npz-file', type=str, default='/data/converted_features_npy', help='轉換後的特徵文件路徑')
+    parser.add_argument('--batch-size', type=int, default=256, help='批次大小')
+    parser.add_argument('--num-epochs', type=int, default=30, help='微調輪數')
+    parser.add_argument('--learning-rate', type=float, default=5e-4, help='微調學習率')
+    parser.add_argument('--val-split', type=float, default=0.2, help='驗證集比例')
+    parser.add_argument('--device', type=str, default='cuda', help='計算設備')
+    parser.add_argument('--seed', type=int, default=42, help='隨機種子')
+    parser.add_argument('--d-model', type=int, default=512, help='隱層維度')
+    parser.add_argument('--num-workers', type=int, default=4, help='DataLoader worker 數量')
+    parser.add_argument('--prefetch-factor', type=int, default=2, help='每個 worker 預先載入的 batch 數量')
+    parser.add_argument('--max-samples', type=int, default=None, help='限制使用的總軌跡數量（快速測試用）')
+    parser.add_argument('--checkpoint-dir', type=str, default='/workspace/Mahjong/checkpoints/bc_multhead', help='模型 checkpoint 儲存目錄')
+    parser.add_argument('--loss-mode', type=str, default='ce', choices=['ce', 'focal'], help='損失函數模式：ce（標準 CrossEntropy）或 focal（Focal Loss）')
+    parser.add_argument('--focal-gamma', type=float, default=2.0, help='Focal Loss 聚焦指數 γ（僅 loss_mode=focal 時生效）')
+    parser.add_argument('--kong-weight', type=float, default=3.0, help='Kong 區間 (141~174) alpha 加權倍率（僅 loss_mode=focal 時生效）')
 
     args = parser.parse_args()
 
@@ -330,11 +353,14 @@ def main():
     np.random.seed(args.seed)
 
     # ========== 微調初始化 ==========
-    model, optimizer = setup_multihead_finetune(
+    model, optimizer, focal_loss = setup_multihead_finetune(
         pretrained_path=args.pretrained,
         d_model=args.d_model,
         finetune_lr=args.learning_rate,
         device=args.device,
+        loss_mode=args.loss_mode,
+        focal_gamma=args.focal_gamma,
+        kong_weight=args.kong_weight,
     )
 
     # ========== 加載數據 ==========
@@ -390,6 +416,9 @@ def main():
         val_loader=val_loader,
         num_epochs=args.num_epochs,
         device=args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        loss_mode=args.loss_mode,
+        focal_loss=focal_loss,
     )
 
 

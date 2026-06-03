@@ -28,7 +28,7 @@ def train_bc(
     num_epochs: int = 50,
     learning_rate: float = 1e-3,
     device: str = 'cuda',
-    checkpoint_dir: str = '/workspace/Mahjong/checkpoints/bc_model_v2'
+    checkpoint_dir: str = '/workspace/Mahjong/checkpoints/'
 ):
     """
     BC訓練循環
