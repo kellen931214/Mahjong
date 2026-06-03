@@ -154,8 +154,10 @@ def run_offline_eval_from_dataset(args):
     # ── 3. 逐 batch 推論，流式計數（O(1) 記憶體，避免 OOM）──
     tracker = StreamingAccuracyTracker()
     total_valid_samples = 0
-    total_trajectories = 0        # 軌跡總數
-    agari_trajectories = 0        # 和了軌跡數（最後有效動作為 TSUMO=175 或 RON=176）
+    total_trajectories = 0              # 軌跡總數
+    predicted_agari = 0                 # 模型預測和了次數（最後有效步 argmax 為 175/176）
+    predicted_agari_correct = 0         # 模型預測和了且標註確為和了的次數
+    actual_agari = 0                    # 標註實際和了次數
 
     print(f"\n🚀 開始推論 ({len(val_loader)} batches)...")
     with torch.no_grad():
@@ -175,21 +177,23 @@ def run_offline_eval_from_dataset(args):
             B, T = target_action.shape
             batch_logits = []
             batch_targets = []
+            last_positions = []  # (b, t_last, actual_tid) 每條軌跡最後一個有效位置
 
             for b in range(B):
-                last_valid_tid = None  # 追蹤該軌跡最後一個有效動作（用於和了率）
+                last_valid_t = -1
+                last_valid_tid = None
                 for t in range(T):
                     tid = target_action[b, t].item()
                     if tid < 0 or tid in (179, 180):
                         continue
                     batch_logits.append(pred_action[b, t])
                     batch_targets.append(tid)
+                    last_valid_t = t
                     last_valid_tid = tid
 
-                if last_valid_tid is not None:
+                if last_valid_t >= 0:
                     total_trajectories += 1
-                    if last_valid_tid in (175, 176):  # TSUMO, RON
-                        agari_trajectories += 1
+                    last_positions.append((b, last_valid_t, last_valid_tid))
 
             if len(batch_targets) == 0:
                 continue
@@ -200,12 +204,24 @@ def run_offline_eval_from_dataset(args):
             tracker.update(batch_logits_t, batch_targets_t)
             total_valid_samples += len(batch_targets)
 
+            # 🔥 模型預測的和了率：每條軌跡最後一步 argmax 是否為 175/176
+            for b, t_last, actual_tid in last_positions:
+                pred_tid = pred_action[b, t_last].argmax(dim=-1).item()
+                if pred_tid in (175, 176):
+                    predicted_agari += 1
+                    if actual_tid in (175, 176):
+                        predicted_agari_correct += 1
+                if actual_tid in (175, 176):
+                    actual_agari += 1
+
             # 🔥 立即釋放本 batch 的 GPU/CPU tensor
-            del batch_logits, batch_targets, batch_logits_t, batch_targets_t
+            del batch_logits, batch_targets, batch_logits_t, batch_targets_t, last_positions
 
             if (batch_idx + 1) % max(1, len(val_loader) // 10) == 0:
+                pred_rate = (predicted_agari / total_trajectories * 100) if total_trajectories > 0 else 0
                 print(f"  進度: {batch_idx + 1}/{len(val_loader)} batches, "
-                      f"已處理 {total_valid_samples} 有效樣本, {total_trajectories} 軌跡")
+                      f"已處理 {total_valid_samples} 有效樣本, {total_trajectories} 軌跡, "
+                      f"預測和了率 {pred_rate:.1f}%")
 
     print(f"\n  推論完成，共處理 {total_valid_samples} 個有效動作樣本, {total_trajectories} 條軌跡")
 
@@ -226,13 +242,20 @@ def run_offline_eval_from_dataset(args):
         else:
             print(f"    {cat:>8s} 準確率 : {val*100:.2f}%")
 
-    # ── 5. 輸出軌跡級指標 ──
-    win_rate = (agari_trajectories / total_trajectories * 100) if total_trajectories > 0 else 0.0
+    # ── 5. 輸出軌跡級指標（模型預測視角）──
+    pred_win_rate = (predicted_agari / total_trajectories * 100) if total_trajectories > 0 else 0.0
+    actual_win_rate = (actual_agari / total_trajectories * 100) if total_trajectories > 0 else 0.0
+    agari_precision = (predicted_agari_correct / predicted_agari * 100) if predicted_agari > 0 else 0.0
+    agari_recall = (predicted_agari_correct / actual_agari * 100) if actual_agari > 0 else 0.0
+
     print()
-    print("  局級指標:")
-    print(f"    總軌跡數          : {total_trajectories}")
-    print(f"    和了局數 (Win)     : {agari_trajectories}")
-    print(f"    和了率 (Win Rate)  : {win_rate:.2f}%")
+    print("  局級指標（模型預測和了率）:")
+    print(f"    總軌跡數                : {total_trajectories}")
+    print(f"    模型預測和了次數         : {predicted_agari}")
+    print(f"    模型預測和了率 (Pred Win): {pred_win_rate:.2f}%")
+    print(f"    標註實際和了率 (True Win): {actual_win_rate:.2f}%")
+    print(f"    預測和了精確率 (Precision): {agari_precision:.2f}%")
+    print(f"    預測和了召回率 (Recall)   : {agari_recall:.2f}%")
     print("=" * 60)
 
 
