@@ -121,6 +121,15 @@ class MahjongFocalLoss(nn.Module):
             loss : scalar 或 (N,) tensor
         """
         # ══════════════════════════════════════════════════════════════
+        # Step 0: 確保模組 buffer (alpha) 與輸入 tensor 在同一裝置上
+        # ══════════════════════════════════════════════════════════════
+        # register_buffer 不會自動跟隨外部 model.to(device)（因為此模組
+        # 獨立於 DecisionMambaMultiHead 之外）。此處顯式同步，確保後續
+        # alpha 索引操作不會觸發跨裝置錯誤。
+        if self.alpha.device != logits.device:
+            self.to(logits.device)
+
+        # ══════════════════════════════════════════════════════════════
         # Step 1: 展平（Flatten）— 將時序維度合併到 Batch 維度
         # ══════════════════════════════════════════════════════════════
         # logits:  (B, T, 181) → (B*T, 181)

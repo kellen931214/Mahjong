@@ -241,7 +241,7 @@ def train_multhead_finetune(
                 train_metrics[key] += metrics[key]
             train_steps += 1
 
-            print_every = max(1, min(10, len(train_loader) // 20))
+            print_every = 1000
             if (batch_idx + 1) % print_every == 0 or batch_idx == 0:
                 print(
                     f"  Epoch {epoch}/{num_epochs} | "
