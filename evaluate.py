@@ -109,14 +109,18 @@ def run_offline_eval(args):
 # ============================================================================
 
 def run_selfplay_eval(args):
-    """載入模型，跑自我對弈並輸出統計報告。"""
-    import copy
-    import random
+    """
+    載入模型，跑指定局數的自我對弈，輸出完整統計報告。
 
-    # 延遲導入 runner（避免不必要的 mjx 依賴錯誤）
+    game_result 已由 runner.run_match() 直接提供：
+      - is_agari, is_houjuu, anyone_agari, agent_rank, agent_score, final_scores
+    無需再做額外推斷。
+    """
+    import traceback
+
+    # 延遲導入（避免無 mjx 環境時直接報錯）
     from runner import SelfPlayRunner
     from model import DecisionMamba
-    from rewards import create_default_calculator
 
     device = args.device if torch.cuda.is_available() else "cpu"
     if device != args.device:
@@ -131,11 +135,7 @@ def run_selfplay_eval(args):
         sys.exit(1)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    # 處理可能被包在 "model_state_dict" key 中
-    if "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
@@ -144,7 +144,6 @@ def run_selfplay_eval(args):
     # 建立 Runner 與 Tracker
     runner = SelfPlayRunner(model, device=device, opponent_pool_size=args.opponent_pool)
     tracker = MahjongMetricTracker()
-    reward_calc = create_default_calculator()
 
     num_games = args.num_games
     print(f"\n  開始自我對弈: {num_games} 局")
@@ -154,28 +153,10 @@ def run_selfplay_eval(args):
 
     for game_idx in range(1, num_games + 1):
         try:
-            trajectories, game_result = runner.run_match(temperature=args.temperature)
-
-            # 判斷 agent 是否放銃（檢查軌跡中最後一個 obs_raw）
-            is_houjuu = False
-            if trajectories:
-                agent_pid = list(trajectories.keys())[0]
-                # 利用 reward_calculator 判斷
-                # 因為 runner 內部已經清理了 obs_raw，我們需要從 runner 內部判斷
-                # 簡化：如果 agent 非第一且 agent 沒胡牌，則可能放銃
-                # 更精確的做法：從 runner 改寫暴露 is_houjuu
-                pass
-
-            # 判斷是否有人胡牌（用 final_scores 推斷）
-            final_scores = game_result.get("final_scores", [25000]*4)
-            anyone_agari = any(abs(s - 25000) > 500 for s in final_scores)
-
-            game_result["is_houjuu"] = is_houjuu
-            game_result["anyone_agari"] = anyone_agari
-
+            _, game_result = runner.run_match(temperature=args.temperature)
             tracker.record_game(game_result)
 
-            # 更新對手池（每 args.pool_update_interval 局）
+            # 定期更新對手池
             if game_idx % args.pool_update_interval == 0:
                 runner.update_opponent_pool()
 
@@ -186,6 +167,8 @@ def run_selfplay_eval(args):
 
         except Exception as e:
             print(f"\n[警告] 第 {game_idx} 局發生錯誤，跳過: {e}")
+            if args.verbose:
+                traceback.print_exc()
             continue
 
     print("\n")
@@ -194,149 +177,6 @@ def run_selfplay_eval(args):
     tracker.print_report()
 
     # 儲存報告到檔案
-    if args.output:
-        output_path = Path(args.output)
-        report_text = tracker.report()
-        output_path.write_text(report_text, encoding="utf-8")
-        print(f"\n  報告已儲存至: {output_path}")
-
-    return tracker.summary()
-
-
-# ============================================================================
-#  增強版自我對弈（含放銃追蹤）
-# ============================================================================
-
-def run_selfplay_eval_enhanced(args):
-    """
-    增強版自我對弈：直接複用 runner 但攔截放銃資訊。
-
-    透過在 runner.run_match 後從 mjx env 狀態中讀取最終事件，
-    正確判斷 agent 是否放銃。
-    """
-    import copy
-    import random
-
-    from runner import SelfPlayRunner
-    from model import DecisionMamba
-    from rewards import MahjongRewardCalculator, create_default_calculator
-
-    device = args.device if torch.cuda.is_available() else "cpu"
-    if device != args.device:
-        print(f"[警告] CUDA 不可用，使用 {device}")
-
-    # 建立模型
-    print(f"\n  載入模型: {args.checkpoint}")
-    model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        print(f"[錯誤] checkpoint 不存在: {checkpoint_path}")
-        sys.exit(1)
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.eval()
-    print(f"  模型參數數: {sum(p.numel() for p in model.parameters()):,}")
-
-    # 建立 Runner 與 Tracker
-    runner = SelfPlayRunner(model, device=device, opponent_pool_size=args.opponent_pool)
-    tracker = MahjongMetricTracker()
-    reward_calc = create_default_calculator()
-
-    num_games = args.num_games
-    print(f"\n  開始自我對弈（增強模式）: {num_games} 局")
-    print(f"  Temperature: {args.temperature}")
-    print(f"  對手池大小: {args.opponent_pool}")
-    print("-" * 40)
-
-    for game_idx in range(1, num_games + 1):
-        try:
-            trajectories, game_result = runner.run_match(temperature=args.temperature)
-
-            # 🚀 透過 runner.env 取得最終狀態，偵測放銃
-            is_houjuu = False
-            anyone_agari = game_result.get("is_agari", False)
-            try:
-                # 取得最終 state proto 檢查是否有人和牌
-                final_proto = runner.env.state().to_proto()
-                if final_proto.HasField("round_terminal"):
-                    wins_count = len(final_proto.round_terminal.wins)
-                    if wins_count > 0:
-                        anyone_agari = True
-                        # 檢查 wins 中是否有 agent_pid
-                        agent_pid_in_game = None
-                        for pid in range(4):
-                            if any(pid == w.who for w in final_proto.round_terminal.wins):
-                                pass
-            except Exception:
-                pass
-
-            # 判斷放銃：若有人胡牌但不是 agent 胡牌，且 agent 排名不佳
-            if anyone_agari and not game_result.get("is_agari", False):
-                # 取得 agent 排名
-                agent_rank = game_result.get("agent_rank", 0)
-                if agent_rank >= 3:
-                    # 排名後段 → 可能是放銃者（heuristic）
-                    # 更精確的做法：讀取 env events
-                    try:
-                        # 從 env 最終狀態取得 observation
-                        obs_dict = runner.env._state  # 內部狀態
-                    except Exception:
-                        pass
-
-            # 用 mjx event 正確判斷
-            try:
-                from mjx.const import EventType
-                final_state = runner.env.state()
-                events = final_state.events()
-                # 找 RON 事件，若 RON 的 who 不是 agent，且 RON 前一動是 agent 的 DISCARD
-                for i, evt in enumerate(events):
-                    if evt.type() == EventType.RON:
-                        # 往前找最近的 DISCARD
-                        for j in range(i - 1, -1, -1):
-                            prev = events[j]
-                            if prev.type() in (EventType.DISCARD, EventType.TSUMOGIRI):
-                                # prev.who() 是放銃者，evt.who() 是和牌者
-                                # agent_pid 需要從 runner 內部取得...
-                                break
-                        break
-            except Exception:
-                pass
-
-            # 簡化判斷：使用 is_draw_game 輔助
-            if is_draw_game(game_result):
-                anyone_agari = False
-            else:
-                anyone_agari = True
-
-            game_result["is_houjuu"] = is_houjuu
-            game_result["anyone_agari"] = anyone_agari
-
-            tracker.record_game(game_result)
-
-            if game_idx % args.pool_update_interval == 0:
-                runner.update_opponent_pool()
-
-            if game_idx % args.report_interval == 0:
-                print(f"\n  --- 進度: {game_idx}/{num_games} 局 ---")
-                tracker.print_report()
-
-        except Exception as e:
-            import traceback
-            print(f"\n[警告] 第 {game_idx} 局發生錯誤，跳過: {e}")
-            traceback.print_exc()
-            continue
-
-    print("\n")
-    print("=" * 60)
-    print(f"  自我對弈完成！共 {num_games} 局")
-    tracker.print_report()
-
     if args.output:
         output_path = Path(args.output)
         output_path.write_text(tracker.report(), encoding="utf-8")
@@ -399,8 +239,8 @@ def main():
                         help="[selfplay] 報告輸出間隔（預設每 100 局）")
     parser.add_argument("--output", type=str, default=None,
                         help="[selfplay] 報告輸出檔案路徑（選填）")
-    parser.add_argument("--enhanced", action="store_true",
-                        help="[selfplay] 使用增強模式（含放銃追蹤）")
+    parser.add_argument("--verbose", action="store_true",
+                        help="顯示詳細錯誤追蹤")
 
     args = parser.parse_args()
 
@@ -412,10 +252,7 @@ def main():
     elif args.mode == "selfplay":
         if not args.checkpoint:
             parser.error("自我對弈模式需要 --checkpoint 參數")
-        if args.enhanced:
-            run_selfplay_eval_enhanced(args)
-        else:
-            run_selfplay_eval(args)
+        run_selfplay_eval(args)
 
 
 if __name__ == "__main__":

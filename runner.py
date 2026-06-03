@@ -276,8 +276,11 @@ class SelfPlayRunner:
             "final_scores": final_scores,
             "agent_score": agent_score,
             "agent_rank": agent_rank,
+            "agent_pid": agent_pid,
             "is_win": (agent_rank == 1),
             "is_agari": is_agari,
+            "is_houjuu": is_houjuu,
+            "anyone_agari": (len(wins_pids) > 0),
         }
         
         return trajectories, game_result
