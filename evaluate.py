@@ -154,6 +154,8 @@ def run_offline_eval_from_dataset(args):
     # ── 3. 逐 batch 推論，流式計數（O(1) 記憶體，避免 OOM）──
     tracker = StreamingAccuracyTracker()
     total_valid_samples = 0
+    total_trajectories = 0        # 軌跡總數
+    agari_trajectories = 0        # 和了軌跡數（最後有效動作為 TSUMO=175 或 RON=176）
 
     print(f"\n🚀 開始推論 ({len(val_loader)} batches)...")
     with torch.no_grad():
@@ -175,12 +177,19 @@ def run_offline_eval_from_dataset(args):
             batch_targets = []
 
             for b in range(B):
+                last_valid_tid = None  # 追蹤該軌跡最後一個有效動作（用於和了率）
                 for t in range(T):
                     tid = target_action[b, t].item()
                     if tid < 0 or tid in (179, 180):
                         continue
                     batch_logits.append(pred_action[b, t])
                     batch_targets.append(tid)
+                    last_valid_tid = tid
+
+                if last_valid_tid is not None:
+                    total_trajectories += 1
+                    if last_valid_tid in (175, 176):  # TSUMO, RON
+                        agari_trajectories += 1
 
             if len(batch_targets) == 0:
                 continue
@@ -196,9 +205,9 @@ def run_offline_eval_from_dataset(args):
 
             if (batch_idx + 1) % max(1, len(val_loader) // 10) == 0:
                 print(f"  進度: {batch_idx + 1}/{len(val_loader)} batches, "
-                      f"已處理 {total_valid_samples} 有效樣本")
+                      f"已處理 {total_valid_samples} 有效樣本, {total_trajectories} 軌跡")
 
-    print(f"\n  推論完成，共處理 {total_valid_samples} 個有效動作樣本")
+    print(f"\n  推論完成，共處理 {total_valid_samples} 個有效動作樣本, {total_trajectories} 條軌跡")
 
     if total_valid_samples == 0:
         print("[錯誤] 沒有有效樣本可供評估")
@@ -216,6 +225,14 @@ def run_offline_eval_from_dataset(args):
             print(f"    {cat:>8s} 準確率 : N/A (無此類別樣本)")
         else:
             print(f"    {cat:>8s} 準確率 : {val*100:.2f}%")
+
+    # ── 5. 輸出軌跡級指標 ──
+    win_rate = (agari_trajectories / total_trajectories * 100) if total_trajectories > 0 else 0.0
+    print()
+    print("  局級指標:")
+    print(f"    總軌跡數          : {total_trajectories}")
+    print(f"    和了局數 (Win)     : {agari_trajectories}")
+    print(f"    和了率 (Win Rate)  : {win_rate:.2f}%")
     print("=" * 60)
 
 
