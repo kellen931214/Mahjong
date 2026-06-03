@@ -3,7 +3,12 @@ evaluation_metrics.py — 離線準確率計算 + 線上對局統計追蹤
 
 基於 Suphx 論文評估指標體系：
   1. 離線模型準確率（Offline Action Accuracy）：按動作類別分別計算
-  2. 線上對局統計器（Online Tracker）：追蹤和了率、放銃率、順位分佈等
+  2. 線上對局統計器（Online Tracker）：以 per-hand（每局牌）語義追蹤和了率、放銃率、順位分佈等
+
+🆕 v2 重大變更（符合 Suphx 學術標準）：
+  - 和了率 / 放銃率分母從 total_games（半莊數）改為 total_hands（每局牌數）
+  - 流局判定優先使用 proto round_terminal.no_winner 原生欄位
+  - Fallback 分數閾值從 ±1000 放寬到 ±4000（容納不聽罰符＋立直棒）
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -279,18 +284,20 @@ class StreamingAccuracyTracker:
 
 
 # ============================================================================
-#  2. 線上對局統計器 (Online Tracker)
+#  2. 線上對局統計器 (Online Tracker) — 以 per-hand 語義計算學術指標
 # ============================================================================
 
 class MahjongMetricTracker:
     """
     追蹤模型在數千場自主對弈（Self-Play）中的核心指標。
 
-    動態維護並計算：
-      - 和了率 (Win Rate)：自己胡牌的次數 / 總局數
-      - 放銃率 (Deal-in Rate)：點炮給對手的次數 / 總局數
+    🆕 v2：以 per-hand（每局牌）語義計算和了率/放銃率。
+    分母 = total_hands（總局數），而非 total_games（總半莊數）。
+
+    符合 Suphx 論文規範：
+      - 和了率 (Win Rate)：agent 胡牌局數 / 總局數
+      - 放銃率 (Deal-in Rate)：agent 放銃局數 / 總局數
       - 順位分佈 (Placement Distribution)：1/2/3/4 名的精確百分比
-      - 每局是和局還是有贏牌
 
     使用方式:
         tracker = MahjongMetricTracker()
@@ -305,77 +312,123 @@ class MahjongMetricTracker:
 
     def reset(self):
         """重置所有統計計數器。"""
+        # ── Game-level 計數器（半莊維度） ──
         self.total_games = 0
-        self.wins = 0                    # agent 胡牌次數（is_agari=True）
-        self.deal_ins = 0                # agent 放銃次數
         self.placements = {1: 0, 2: 0, 3: 0, 4: 0}  # 排名計數
-        self.draw_games = 0              # 和局（無人和牌）次數
-        self.agari_games = 0             # 有人胡牌的局數
         self.cumulative_scores: List[float] = []  # 累積分數用於計算均分
+
+        # 🆕 Hand-level 計數器（Per-hand 和了率/放銃率分母）
+        self.total_hands = 0
+        self.wins = 0          # agent 胡牌局數（per-hand）
+        self.deal_ins = 0      # agent 放銃局數（per-hand）
+        self.draw_hands = 0    # 流局局數
+
+    def record_hand(self, hand_result: Dict):
+        """
+        記錄一局牌（hand）的結果，以 per-hand 語義累加。
+
+        Args:
+            hand_result: dict，由 runner.py 在每局結束時產生
+                預期包含以下 key：
+                - "is_draw" (bool): 是否為流局
+                - "agent_won" (bool): agent 是否胡牌
+                - "agent_deal_in" (bool): agent 是否放銃
+        """
+        self.total_hands += 1
+
+        if hand_result.get("agent_won", False):
+            self.wins += 1
+
+        if hand_result.get("agent_deal_in", False):
+            self.deal_ins += 1
+
+        if hand_result.get("is_draw", False):
+            self.draw_hands += 1
 
     def record_game(self, game_result: Dict):
         """
-        記錄一局遊戲的結果。
+        記錄一局完整遊戲（半莊）的結果。
+
+        🆕 若 game_result 包含 "hand_results"，則逐手呼叫 record_hand()，
+        以 per-hand 語義計算和了率/放銃率。
+        若 game_result 不含 "hand_results"（向後相容舊版 runner），
+        則 fallback 為舊有的 game-level 邏輯。
 
         Args:
             game_result: 來自 SelfPlayRunner.run_match() 的 game_result dict。
                 預期包含以下 key：
-                - "is_agari" (bool): agent 是否胡牌
                 - "agent_rank" (int): agent 排名 (1~4)
                 - "is_win" (bool): agent 是否為第一名
                 - "final_scores" (List[int]): 四人最終分數
                 - "agent_score" (int): agent 最終分數
-                - "is_houjuu" (bool, optional): agent 是否放銃。
-                  若未提供則預設為 False。
-                - "anyone_agari" (bool, optional): 本局是否有人胡牌。
-                  若未提供則用 is_draw_game() 從 final_scores 反推。
+                - "is_agari" (bool, optional): agent 是否胡牌（舊版 fallback）
+                - "is_houjuu" (bool, optional): agent 是否放銃（舊版 fallback）
+                - "anyone_agari" (bool, optional): 本局是否有人胡牌（舊版 fallback）
+                🆕 "hand_results" (List[Dict], optional): per-hand 統計
+                🆕 "total_hands" (int, optional): 總局數
         """
         self.total_games += 1
 
-        # 和了
-        if game_result.get("is_agari", False):
-            self.wins += 1
+        # ── 🆕 Per-hand 處理 ──
+        hand_results = game_result.get("hand_results", None)
+        if hand_results is not None and len(hand_results) > 0:
+            for hand in hand_results:
+                self.record_hand(hand)
+        else:
+            # ── 向後相容：舊版 game_result 不含 hand_results ──
+            # 使用 game-level 的 is_agari / is_houjuu / anyone_agari 作為 fallback。
+            # 注意：這是 per-game 語義，精確度不如 per-hand。
+            if game_result.get("is_agari", False):
+                self.wins += 1
+                self.total_hands += 1
+            if game_result.get("is_houjuu", False):
+                self.deal_ins += 1
+                self.total_hands += 1
 
-        # 放銃
-        if game_result.get("is_houjuu", False):
-            self.deal_ins += 1
+            # 流局推斷（舊版 fallback 邏輯）
+            anyone_agari = game_result.get("anyone_agari", None)
+            if anyone_agari is None:
+                anyone_agari = not is_draw_game(
+                    game_result,
+                    round_terminal=None,  # 舊版沒有 round_terminal
+                )
+            if not anyone_agari:
+                self.draw_hands += 1
+                if self.total_hands == 0 or (not game_result.get("is_agari", False) and not game_result.get("is_houjuu", False)):
+                    # 確保流局也被計入分母
+                    self.total_hands += 1
 
-        # 排名
+        # ── Game-level 排名 ──
         rank = game_result.get("agent_rank", None)
         if rank is not None and 1 <= rank <= 4:
             self.placements[rank] += 1
 
-        # 和局 vs 有人胡牌
-        anyone_agari = game_result.get("anyone_agari", None)
-        if anyone_agari is None:
-            # 🚀【修正】不能 fallback 到 is_agari：若對手胡牌但 agent 沒胡，
-            # is_agari=False 會把「有人胡牌」誤判為和局，造成 draw_games 被放大 3~4 倍。
-            # 正確做法：用 is_draw_game() 從 final_scores 反推是否為和局。
-            anyone_agari = not is_draw_game(game_result)
-
-        if anyone_agari:
-            self.agari_games += 1
-        else:
-            self.draw_games += 1
-
-        # 累積分數
+        # ── 累積分數 ──
         agent_score = game_result.get("agent_score", None)
         if agent_score is not None:
             self.cumulative_scores.append(float(agent_score))
 
     @property
     def win_rate(self) -> float:
-        """和了率：自己胡牌次數 / 總局數"""
-        if self.total_games == 0:
+        """
+        🆕 和了率（Per-hand 語義）：agent 胡牌局數 / 總局數
+
+        符合 Suphx 論文規範，分母 = total_hands。
+        """
+        if self.total_hands == 0:
             return 0.0
-        return self.wins / self.total_games
+        return self.wins / self.total_hands
 
     @property
     def deal_in_rate(self) -> float:
-        """放銃率：點炮次數 / 總局數"""
-        if self.total_games == 0:
+        """
+        🆕 放銃率（Per-hand 語義）：agent 放銃局數 / 總局數
+
+        符合 Suphx 論文規範，分母 = total_hands。
+        """
+        if self.total_hands == 0:
             return 0.0
-        return self.deal_ins / self.total_games
+        return self.deal_ins / self.total_hands
 
     @property
     def placement_distribution(self) -> Dict[int, float]:
@@ -398,20 +451,22 @@ class MahjongMetricTracker:
         """回傳完整統計摘要 dict。"""
         return {
             "total_games": self.total_games,
+            "total_hands": self.total_hands,
             "win_rate": self.win_rate,
             "deal_in_rate": self.deal_in_rate,
             "placement_distribution": self.placement_distribution,
             "avg_score": self.avg_score,
             "wins": self.wins,
             "deal_ins": self.deal_ins,
-            "agari_games": self.agari_games,
-            "draw_games": self.draw_games,
+            "draw_hands": self.draw_hands,
             "placements": dict(self.placements),
         }
 
     def report(self) -> str:
         """
         輸出格式化的統計報告字串。
+
+        🆕 同時顯示 game-level（半莊）與 hand-level（每局牌）指標。
 
         Returns:
             str: 多行統計報告
@@ -421,19 +476,22 @@ class MahjongMetricTracker:
             "=" * 60,
             "           麻將 AI 自我對弈統計報告",
             "=" * 60,
-            f"  總局數              : {self.total_games}",
-            f"  和了率 (Win Rate)    : {self.win_rate * 100:.2f}%  ({self.wins}/{self.total_games})",
-            f"  放銃率 (Deal-in Rate): {self.deal_in_rate * 100:.2f}%  ({self.deal_ins}/{self.total_games})",
-            f"  平均終局分數         : {self.avg_score:.1f}",
+            f"  半莊數 (Games)        : {self.total_games}",
+            f"  總局數 (Hands)         : {self.total_hands}",
+            "",
+            "  ── Per-Hand 指標（Suphx 學術標準）──",
+            f"  和了率 (Win Rate)      : {self.win_rate * 100:.2f}%  ({self.wins}/{self.total_hands})",
+            f"  放銃率 (Deal-in Rate)  : {self.deal_in_rate * 100:.2f}%  ({self.deal_ins}/{self.total_hands})",
+            f"  流局率 (Draw Rate)     : {self.draw_hands / max(self.total_hands, 1) * 100:.2f}%  ({self.draw_hands}/{self.total_hands})",
+            "",
+            "  ── Game-Level 指標 ──",
+            f"  平均終局分數           : {self.avg_score:.1f}",
             "",
             "  順位分佈:",
             f"    1 位 (一位): {d[1]:.2f}%  ({self.placements[1]})",
             f"    2 位 (二位): {d[2]:.2f}%  ({self.placements[2]})",
             f"    3 位 (三位): {d[3]:.2f}%  ({self.placements[3]})",
             f"    4 位 (四位): {d[4]:.2f}%  ({self.placements[4]})",
-            "",
-            f"  有人胡牌局數 : {self.agari_games}",
-            f"  和局（流局） : {self.draw_games}",
             "=" * 60,
         ]
         return "\n".join(lines)
@@ -444,26 +502,46 @@ class MahjongMetricTracker:
 
 
 # ============================================================================
-#  輔助：從 runner 的 game_result 判斷是否為和局
+#  輔助：從 game_result 或 proto round_terminal 判斷是否為和局
 # ============================================================================
 
-def is_draw_game(game_result: Dict) -> bool:
+def is_draw_game(
+    game_result: Dict,
+    round_terminal: object = None,
+) -> bool:
     """
     判斷一局是否為和局（流局，無人和牌）。
 
-    判斷邏輯：如果沒有任何玩家胡牌（is_agari 全部為 False），
-    且沒有人分數顯著偏離 25000 起始分，則為和局。
+    🆕 優先使用 proto 原生欄位 round_terminal.no_winner，
+    若不可用則 fallback 至分數變化閾值（放寬至 ±4000）。
+
+    判斷優先級：
+        1. 若 round_terminal 可用且 HasField("no_winner") → True（流局）
+        2. 若 round_terminal 可用且有 wins → False（有人胡牌）
+        3. Fallback：終局分數最大變化 < 4000 點 → True（可能為流局）
 
     Args:
-        game_result: runner 回傳的 game_result
+        game_result: runner 回傳的 game_result dict（含 "final_scores"）
+        round_terminal: 可選的 proto RoundTerminal 物件（None 表示不可用）
 
     Returns:
-        bool: True 表示和局
+        bool: True 表示流局
     """
-    if game_result.get("is_agari", False):
-        return False
-    # 檢查是否有人胡牌引發的分數變動
+    # ── 優先級 1 & 2：使用 proto 原生欄位 ──
+    if round_terminal is not None:
+        try:
+            # HasField("no_winner") 表示流局（荒牌流局、九種九牌、四風連打等）
+            if round_terminal.HasField("no_winner"):
+                return True
+            # 有 wins 表示有人胡牌
+            if len(round_terminal.wins) > 0:
+                return False
+        except Exception:
+            pass  # proto 存取失敗時 fallback 到分數判斷
+
+    # ── 優先級 3：Fallback 分數閾值（放寬至 4000） ──
+    # 日麻荒牌流局中，不聽罰符變化範圍為 ±1000～±3000，
+    # 若加上立直棒沉底（每根 1000）極端情況可能達 ±3000 + 1000 = ±4000
     scores = game_result.get("final_scores", [25000, 25000, 25000, 25000])
     max_delta = max(abs(s - 25000) for s in scores)
-    # 若所有人分數變動都在 ±1000 以內，極可能是和局
-    return max_delta < 1000
+    return max_delta < 4000

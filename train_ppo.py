@@ -32,8 +32,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from model import DecisionMamba
-from runner import SelfPlayRunner
-from train_ppo_step import train_ppo_epoch
+from utli.runner import SelfPlayRunner
+from utli.train_ppo_step import train_ppo_epoch
 
 
 # ==================== PPO 主訓練函數 ====================
@@ -52,6 +52,7 @@ def train_ppo(
     game_stats_window: int = 50,  # 🆕 滑動窗口大小（計算贏牌率等）
     d_model: int = 512,
     action_dim: int = 181,
+    train_mode: str = "attack",
     state_dim: int = 1380,
     max_ep_len: int = 2048,
     # 🆕 LoRA PPO 超參數
@@ -102,12 +103,14 @@ def train_ppo(
     checkpoint = torch.load(bc_checkpoint_path, map_location=device, weights_only=False)
     # 支援直接載入 state_dict 或包裝後的 checkpoint dict
     if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
         print(f"   ✅ 載入 BC checkpoint (epoch {checkpoint.get('epoch', '?')})")
         print(f"   BC val_loss: {checkpoint.get('val_loss', '?'):.4f}, val_acc: {checkpoint.get('val_acc', '?'):.4f}")
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
         print("   ✅ 載入原始 state_dict")
+
+    model.load_state_dict(state_dict, strict=False)
 
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
@@ -138,8 +141,9 @@ def train_ppo(
         model=model,
         device=str(device),
         opponent_pool_size=opponent_pool_size,
+        train_mode=train_mode,
     )
-    print("   ✅ Runner 初始化完成")
+    print(f"   ✅ Runner 初始化完成（train_mode={train_mode}）")
 
     # ========== 6. 準備 Checkpoint 目錄與日誌 ==========
     checkpoint_dir = Path(checkpoint_dir)
@@ -177,7 +181,7 @@ def train_ppo(
     print(f"   開始時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
 
-    best_avg_reward = -float("inf")
+    best_avg_rank = float("inf")  # 🆕 用窗口均排名選最佳模型（越低越好）
 
     for iteration in range(1, num_iterations + 1):
         # -------- 7a. 執行一局自我博弈 + PPO 更新 --------
@@ -191,6 +195,7 @@ def train_ppo(
             value_coef=value_coef,
             clip_epsilon=clip_epsilon,
             max_grad_norm=max_grad_norm,
+            num_trajectories=8,
         )
 
         # -------- 7b. 記錄指標 --------
@@ -272,32 +277,32 @@ def train_ppo(
             )
             print(f"💾 Checkpoint 已保存: {ckpt_path}")
 
-        # -------- 7g. 追蹤最佳模型（按 avg_reward）--------
-        if metrics["avg_reward"] > best_avg_reward:
-            best_avg_reward = metrics["avg_reward"]
-            # 🆕 同時記錄此時的窗口贏牌率
-            if len(game_window) > 0:
-                best_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
-            else:
-                best_win_rate = 0.0
-            best_ckpt_path = checkpoint_dir / "best_ppo_lora_model.pt"
-            torch.save(
-                {
-                    "iteration": iteration,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_avg_reward": best_avg_reward,
-                    "best_win_rate": best_win_rate,
-                    "history": history,
-                },
-                best_ckpt_path,
-            )
-            print(f"🏆 新最佳模型！Avg Reward: {best_avg_reward:.4f} (近{len(game_window)}局贏牌率: {best_win_rate:.1f}%) → {best_ckpt_path}")
+        # -------- 7g. 🆕 追蹤最佳模型（按窗口均排名）--------
+        # 用均排名取代 avg_reward：排名直接反映牌力，不受 reward hacking 影響
+        if len(game_window) >= 50:
+            current_avg_rank = sum(g.get("agent_rank", 3) for g in game_window) / len(game_window)
+            if current_avg_rank < best_avg_rank:
+                best_avg_rank = current_avg_rank
+                current_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+                best_ckpt_path = checkpoint_dir / "best_ppo_lora_model.pt"
+                torch.save(
+                    {
+                        "iteration": iteration,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_avg_rank": best_avg_rank,
+                        "current_avg_rank": current_avg_rank,
+                        "window_win_rate": current_win_rate,
+                        "history": history,
+                    },
+                    best_ckpt_path,
+                )
+                print(f"🏆 新最佳模型！均排名: {best_avg_rank:.2f} (近{len(game_window)}局贏牌率: {current_win_rate:.1f}%) → {best_ckpt_path}")
 
     # ========== 8. 訓練完成，保存最終模型與日誌 ==========
     print(f"\n{'='*70}")
     print(f"✅ PPO + LoRA 訓練完成")
-    print(f"   最佳 Avg Reward: {best_avg_reward:.4f}")
+    print(f"   最佳均排名: {best_avg_rank:.2f}")
     if len(game_window) > 0:
         final_win_rate = sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
         print(f"   最終窗口贏牌率 ({len(game_window)}局): {final_win_rate:.1f}%")
@@ -311,7 +316,7 @@ def train_ppo(
             "iteration": num_iterations,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "best_avg_reward": best_avg_reward,
+            "best_avg_rank": best_avg_rank,
             "history": history,
         },
         final_ckpt_path,
@@ -431,6 +436,10 @@ def main():
         help="狀態特徵維度（decision-mamba-v0 = 1380）",
     )
     parser.add_argument(
+        "--mode", type=str, default="attack", choices=["attack", "defense"],
+        help="訓練模式: attack=進攻 reward（預設）, defense=防守 reward",
+    )
+    parser.add_argument(
         "--max-ep-len", type=int, default=2048,
         help="最大軌跡長度（用於 timestep embedding）",
     )
@@ -465,6 +474,7 @@ def main():
         d_model=args.d_model,
         action_dim=args.action_dim,
         state_dim=args.state_dim,
+        train_mode=args.mode,
         max_ep_len=args.max_ep_len,
         temperature=args.temperature,
         entropy_coef=args.entropy_coef,

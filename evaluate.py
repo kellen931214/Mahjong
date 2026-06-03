@@ -26,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 # 導入本地模組
-from evaluation_metrics import (
+from utli.evaluation_metrics import (
     compute_offline_accuracy,
     compute_detailed_accuracy,
     MahjongMetricTracker,
@@ -310,38 +310,54 @@ def run_selfplay_eval(args):
     import traceback
 
     # 延遲導入（避免無 mjx 環境時直接報錯）
-    from runner import SelfPlayRunner
+    from utli.runner import SelfPlayRunner
     from model import DecisionMamba, DecisionMambaMultiHead
 
     device = args.device if torch.cuda.is_available() else "cpu"
     if device != args.device:
         print(f"[警告] CUDA 不可用，使用 {device}")
 
-    # 🔍 建立模型（自動偵測單頭 vs 多頭 checkpoint）
-    print(f"\n  載入模型: {args.checkpoint}")
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        print(f"[錯誤] checkpoint 不存在: {checkpoint_path}")
-        sys.exit(1)
+    # ── 共用：載入模型權重函式 ──
+    def _load_model(checkpoint_path_str: str, model_label: str):
+        """載入 DecisionMamba checkpoint，自動偵測單頭/多頭架構。"""
+        cp_path = Path(checkpoint_path_str)
+        if not cp_path.exists():
+            print(f"[錯誤] {model_label} checkpoint 不存在: {cp_path}")
+            sys.exit(1)
+        cp = torch.load(cp_path, map_location=device, weights_only=False)
+        sd = cp.get("model_state_dict", cp)
+        is_mh = any(k.startswith("head_action.head_") for k in sd.keys())
+        arch = "DecisionMambaMultiHead" if is_mh else "DecisionMamba"
+        print(f"  🧠 {model_label} → {arch} (from {cp_path})")
+        m = (DecisionMambaMultiHead if is_mh else DecisionMamba)(
+            d_model=512, action_dim=181, state_dim=1380
+        )
+        m.load_state_dict(sd, strict=False)
+        m.to(device)
+        m.eval()
+        return m
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    # 🔍 載入 PPO agent 模型
+    agent_model = _load_model(args.checkpoint, "Agent (PPO)")
 
-    is_multihead = any(k.startswith("head_action.head_") for k in state_dict.keys())
-    if is_multihead:
-        print(f"  🧠 偵測到多頭架構 checkpoint → 使用 DecisionMambaMultiHead")
-        model = DecisionMambaMultiHead(d_model=512, action_dim=181, state_dim=1380)
+    # 🆕 載入 BC baseline 對手模型（若指定）
+    opponent_base_model = None
+    if args.baseline_checkpoint:
+        opponent_base_model = _load_model(args.baseline_checkpoint, "Opponent (BC)")
+        print(f"  🆚 PPO vs BC 對比模式：agent=PPO，對手=BC baseline")
     else:
-        print(f"  🧠 偵測到單頭架構 checkpoint → 使用 DecisionMamba")
-        model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
-
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.eval()
-    print(f"  模型參數數: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"  🎮 自我對弈模式：所有玩家用同一模型")
 
     # 建立 Runner 與 Tracker
-    runner = SelfPlayRunner(model, device=device, opponent_pool_size=args.opponent_pool)
+    eval_mode = getattr(args, "eval_mode", "attack")
+    print(f"  🌟 攻守模式: {eval_mode}")
+    runner = SelfPlayRunner(
+        agent_model,
+        device=device,
+        opponent_pool_size=args.opponent_pool,
+        train_mode=eval_mode,
+        opponent_base_model=opponent_base_model,
+    )
     tracker = MahjongMetricTracker()
 
     num_games = args.num_games
@@ -456,6 +472,10 @@ def main():
                         help="[selfplay] 報告輸出檔案路徑（選填）")
     parser.add_argument("--verbose", action="store_true",
                         help="顯示詳細錯誤追蹤")
+    parser.add_argument("--eval-mode", type=str, default="attack", choices=["attack", "defense"],
+                        help="[selfplay] 評估模式：attack=使用進攻 reward, defense=使用防守 reward")
+    parser.add_argument("--baseline-checkpoint", type=str, default=None,
+                        help="[selfplay] BC 基線模型 checkpoint（用於 PPO vs BC 對比評估）")
 
     args = parser.parse_args()
 

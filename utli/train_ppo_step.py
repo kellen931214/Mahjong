@@ -23,9 +23,14 @@ def train_ppo_epoch(
     max_grad_norm=0.5,
     temperature=2.0,
     device="cuda",
+    num_trajectories=8,
 ):
     """
     訓練一個 PPO epoch。軌跡收集與反向傳播全部 inline，確保每一步都在 with torch.no_grad() 外。
+
+    🆕 num_trajectories：每 iter 收集 N 條軌跡後合併更新。
+    多軌跡可降低梯度方差（中心極限定理：N 條軌跡的 gradient variance ≈ 1/N），
+    讓 PPO 更穩定、更易收斂。
 
     Args:
         model: DecisionMamba 模型
@@ -40,6 +45,7 @@ def train_ppo_epoch(
         max_grad_norm: 梯度裁剪閾值（防止 GAE 劇烈變動導致梯度爆炸）
         temperature: Logit 採樣溫度（Softmax 前除以係數，拉平極端分佈）
         device: 計算設備
+        num_trajectories: 每 iter 收集的軌跡數（預設 8，降低梯度方差）
 
     Returns:
         dict: {'policy_loss': float, 'value_loss': float, 'entropy': float,
@@ -49,7 +55,7 @@ def train_ppo_epoch(
     import torch
     import numpy as np
     import random
-    from rewards import create_default_calculator
+    from utli.rewards import create_default_calculator
     from torch.distributions import Categorical
     import mjx
 
@@ -59,25 +65,43 @@ def train_ppo_epoch(
     all_trajectory_data = defaultdict(list)
     total_reward = 0.0
     max_len = 0
+    game_lengths = []  # 🆕 追蹤每場遊戲的步數，用於 GAE / RTG 邊界重置
 
-    trajectories_dict, game_result = runner.run_match(temperature=temperature)
-    for pid, pid_trajectories in trajectories_dict.items():
-        if len(pid_trajectories) == 0:
-            continue
+    # ── 🆕 收集 N 條軌跡 ──
+    last_game_result = {}
+    for traj_idx in range(num_trajectories):
+        trajectories_dict, game_result = runner.run_match(temperature=temperature)
+        if traj_idx == num_trajectories - 1:
+            last_game_result = game_result
 
-        for step_data in pid_trajectories:
-            all_trajectory_data["obs"].append(step_data["obs"].cpu().unsqueeze(0))
-            all_trajectory_data["action"].append(torch.tensor(step_data["action"], dtype=torch.long).unsqueeze(0))
-            all_trajectory_data["reward"].append(torch.tensor(step_data["reward"], dtype=torch.float32).unsqueeze(0))
-            all_trajectory_data["log_prob"].append(torch.tensor(step_data["log_prob"], dtype=torch.float32).unsqueeze(0))
-            all_trajectory_data["timestep"].append(torch.tensor(step_data["timestep"], dtype=torch.long).unsqueeze(0))
-            # 🚀 直接使用 runner 提供的 boolean legal_mask
-            legal_mask_i = step_data["mask"]
-            all_trajectory_data["legal_mask"].append(legal_mask_i.cpu().unsqueeze(0))
+        game_step_count = 0
+        for pid, pid_trajectories in trajectories_dict.items():
+            if len(pid_trajectories) == 0:
+                continue
 
-        trajectory_len = len(pid_trajectories)
-        total_reward += pid_trajectories[-1]["reward"] if trajectory_len > 0 else 0.0
-        max_len = max(max_len, trajectory_len)
+            for step_data in pid_trajectories:
+                all_trajectory_data["obs"].append(step_data["obs"].cpu().unsqueeze(0))
+                all_trajectory_data["action"].append(torch.tensor(step_data["action"], dtype=torch.long).unsqueeze(0))
+                all_trajectory_data["reward"].append(torch.tensor(step_data["reward"], dtype=torch.float32).unsqueeze(0))
+                all_trajectory_data["log_prob"].append(torch.tensor(step_data["log_prob"], dtype=torch.float32).unsqueeze(0))
+                all_trajectory_data["timestep"].append(torch.tensor(step_data["timestep"], dtype=torch.long).unsqueeze(0))
+                # 🚀 直接使用 runner 提供的 boolean legal_mask
+                legal_mask_i = step_data["mask"]
+                all_trajectory_data["legal_mask"].append(legal_mask_i.cpu().unsqueeze(0))
+                game_step_count += 1
+
+            trajectory_len = len(pid_trajectories)
+            total_reward += pid_trajectories[-1]["reward"] if trajectory_len > 0 else 0.0
+            max_len = max(max_len, trajectory_len)
+
+        game_lengths.append(game_step_count)
+
+    # 🆕 計算遊戲邊界索引（用於 GAE / RTG 在每局交界處重置）
+    boundary_set = set()
+    cumsum = 0
+    for gl in game_lengths[:-1]:  # 最後一局不需在末端重置
+        cumsum += gl
+        boundary_set.add(cumsum)
 
     # 將每個 step 堆疊成完整軌跡張量
     obs_sequence = torch.cat(all_trajectory_data["obs"]).unsqueeze(0)      # (1, seq_len, state_dim)
@@ -90,9 +114,13 @@ def train_ppo_epoch(
     legal_mask_sequence = torch.cat(all_trajectory_data["legal_mask"]).unsqueeze(0).bool()  # (1, seq_len, action_dim)
 
     # 🔧【修正】rtg_sequence 需要最後一維為 1，與 BC 訓練時的形狀 (batch, seq_len, 1) 對齊
+    # 🆕 多軌跡時在遊戲交界處重置 running_rtg
+    seq_len = reward_sequence.shape[1]
     rtg_sequence = torch.zeros_like(reward_sequence).unsqueeze(-1)  # (1, seq_len, 1)
     running_rtg = 1.0
-    for t in range(reward_sequence.shape[1] - 1, -1, -1):
+    for t in range(seq_len - 1, -1, -1):
+        if t + 1 in boundary_set:
+            running_rtg = 1.0  # 🆕 遊戲交界處重置
         running_rtg += reward_sequence[0, t].item()
         rtg_sequence[0, t, 0] = running_rtg
 
@@ -168,9 +196,10 @@ def train_ppo_epoch(
     adv_std = advantages.std() if advantages.numel() > 1 else torch.tensor(0.0, device=device)
     advantages = (advantages - adv_mean) / (adv_std + EPS)
 
-    ret_mean = returns.mean()
-    ret_std = returns.std() if returns.numel() > 1 else torch.tensor(0.0, device=device)
-    returns_norm = (returns - ret_mean) / (ret_std + EPS)
+    # 🚀 不標準化 returns：讓 Critic 直接學習原始物理尺度，避免 per-trajectory
+    #    z-score 造成 non-stationary target（每個 iter 的 μ/σ 不同會使 value loss 劇烈震盪）。
+    #    改為保留 ret_std 供後續 value loss 自適應縮放（方案 A）。
+    ret_std = returns.std() if returns.numel() > 1 else torch.tensor(1.0, device=device)
 
     # ========================
     # PPO 更新迴圈
@@ -213,8 +242,10 @@ def train_ppo_epoch(
         surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * adv
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value 損失
-        value_loss = F.mse_loss(new_values, returns_norm.squeeze(0)[:seq_len])
+        # Value 損失（自適應縮放：除以 ret_std 讓 value loss 自動校準至
+        #    與 policy loss 相近的量級，高分大局自動降權，低分局自動升權）
+        value_loss_raw = F.mse_loss(new_values, returns.squeeze(0)[:seq_len])
+        value_loss = value_loss_raw / (ret_std.detach() + 1e-4)
 
         # 總損失
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
@@ -235,7 +266,7 @@ def train_ppo_epoch(
     avg_policy_loss = total_policy_loss / epochs
     avg_value_loss = total_value_loss / epochs
     avg_entropy = total_entropy / epochs
-    avg_reward = total_reward / max(1, len(trajectories_dict))
+    avg_reward = total_reward / max(1, num_trajectories)
 
     # ======================================================================
     # 📊 🚀【新增列印段落】每個 Epoch 結束時將數據格式化輸出到終端機
@@ -253,5 +284,5 @@ def train_ppo_epoch(
         "entropy": avg_entropy,
         "avg_reward": avg_reward,
         "trajectory_length": max_len,
-        "game_result": game_result,
+        "game_result": last_game_result,
     }

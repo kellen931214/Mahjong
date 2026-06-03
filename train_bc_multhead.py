@@ -27,7 +27,7 @@ import argparse
 
 from dataset import BehavioralCloningDataset, bc_collate_fn
 from model import DecisionMambaMultiHead
-from train_bc_step import train_bc_step
+from utli.train_bc_step import train_bc_step
 from utli.focal_loss import MahjongFocalLoss, build_default_alpha_weights
 
 

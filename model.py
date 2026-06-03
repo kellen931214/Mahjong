@@ -175,7 +175,7 @@ class DecisionMambaMultiHead(DecisionMamba):
     """
 
     def __init__(self, d_model=512, action_dim=181, state_dim=1380, max_ep_len=2048):
-        # 先呼叫父類別 __init__ 建立完整骨幹（含舊的 head_action 線性層）
+        # 先呼叫父類別 __init__ 建立完整骨幹
         super().__init__(d_model=d_model, action_dim=action_dim,
                          state_dim=state_dim, max_ep_len=max_ep_len)
         # 覆蓋 head_action 為多頭輸出層
