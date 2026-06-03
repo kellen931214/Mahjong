@@ -5,14 +5,16 @@ evaluate.py — 模型評估主入口
 支援兩種模式：
 
   1. 離線模式 (offline)：
-     載入預存的 logits / targets / mask，計算各動作類別準確率。
-     用法:
+     方式 A — 從預存 .npy 載入:
          python evaluate.py --mode offline --logits logits.npy --targets targets.npy [--mask mask.npy]
+     方式 B — 從模型 + 資料集直接跑推論（使用與 train_bc.py 相同的驗證集分割）:
+         python evaluate.py --mode offline --checkpoint model.pt --data-path /data/converted_features_npy
+                            [--val-split 0.2] [--seed 42] [--batch-size 256] [--device cuda]
 
   2. 自我對弈模式 (selfplay)：
      載入模型權重，跑指定局數的自我對弈，輸出統計報告。
      用法:
-         python evaluate.py --mode selfplay --checkpoint model.pt --num_games 1000 [--device cuda] [--temperature 2.0]
+         python evaluate.py --mode selfplay --checkpoint model.pt --num_games 1000 [--device cuda]
 """
 
 import argparse
@@ -21,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, random_split
 
 # 導入本地模組
 from evaluation_metrics import (
@@ -32,13 +35,14 @@ from evaluation_metrics import (
 
 
 # ============================================================================
-#  模式 1：離線準確率評估
+#  模式 1a：從預存 .npy 檔案評估
 # ============================================================================
 
 def run_offline_eval(args):
     """載入預存的 logits / targets / mask 並計算準確率。"""
     print("=" * 60)
     print("  離線模型準確率評估 (Offline Action Accuracy)")
+    print("  [來源: 預存 .npy 檔案]")
     print("=" * 60)
 
     # 載入 logits
@@ -76,6 +80,123 @@ def run_offline_eval(args):
         mask = mask.unsqueeze(0)
 
     # 計算準確率
+    _print_accuracy_results(logits, targets, mask, args.top_k)
+
+
+# ============================================================================
+#  模式 1b：從模型 + 資料集跑推論評估（使用 BC 驗證集分割）
+# ============================================================================
+
+def run_offline_eval_from_dataset(args):
+    """
+    載入模型 checkpoint 與原始資料集，用與 train_bc.py 相同的 random_split
+    (val_split=0.2, seed=42) 取出驗證集，逐 batch 跑推論後計算各類別準確率。
+    """
+    from dataset import BehavioralCloningDataset, bc_collate_fn
+    from model import DecisionMamba
+
+    device = args.device if torch.cuda.is_available() else "cpu"
+    if device != args.device:
+        print(f"[警告] CUDA 不可用，使用 {device}")
+
+    print("=" * 60)
+    print("  離線模型準確率評估 (Offline Action Accuracy)")
+    print("  [來源: 模型推論 + BC 驗證集分割]")
+    print("=" * 60)
+
+    # ── 1. 載入資料集 ──
+    data_path = Path(args.data_path)
+    if not data_path.exists():
+        print(f"[錯誤] 資料路徑不存在: {data_path}")
+        sys.exit(1)
+    print(f"\n📂 載入資料集: {data_path}")
+    full_dataset = BehavioralCloningDataset(str(data_path))
+
+    # 與 train_bc.py 完全相同的隨機分割
+    dataset_size = len(full_dataset)
+    val_size = int(dataset_size * args.val_split)
+    train_size = dataset_size - val_size
+    _, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+    print(f"   總軌跡數: {dataset_size}")
+    print(f"   驗證集: {val_size} 條 ({args.val_split*100:.0f}%) | seed={args.seed}")
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=bc_collate_fn,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=True if args.num_workers > 0 else False,
+        pin_memory=True,
+    )
+
+    # ── 2. 載入模型 ──
+    print(f"\n🔧 載入模型: {args.checkpoint}")
+    model = DecisionMamba(d_model=512, action_dim=181, state_dim=1380)
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        print(f"[錯誤] checkpoint 不存在: {checkpoint_path}")
+        sys.exit(1)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    model.eval()
+    print(f"   模型參數數: {sum(p.numel() for p in model.parameters()):,}")
+
+    # ── 3. 逐 batch 推論，收集 logits / targets ──
+    all_logits = []
+    all_targets = []
+
+    print(f"\n🚀 開始推論 ({len(val_loader)} batches)...")
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            rtg = batch["rtg"].to(device)
+            state = batch["state"].to(device)
+            input_action = batch["input_action"].to(device)
+            target_action = batch["target_action"].to(device)
+            timesteps = batch["timesteps"].to(device)
+
+            pred_action, _, _, _ = model(
+                rtg=rtg, state=state, action=input_action, timesteps=timesteps
+            )
+            # pred_action: (B, T, 181), target_action: (B, T)
+
+            B, T = target_action.shape
+            for b in range(B):
+                for t in range(T):
+                    tid = target_action[b, t].item()
+                    # 跳過 padding (-100)、NO(179)、DUMMY(180)
+                    if tid < 0 or tid in (179, 180):
+                        continue
+                    all_logits.append(pred_action[b, t].cpu())
+                    all_targets.append(tid)
+
+            if (batch_idx + 1) % max(1, len(val_loader) // 10) == 0:
+                print(f"  進度: {batch_idx + 1}/{len(val_loader)} batches, "
+                      f"已收集 {len(all_targets)} 有效樣本")
+
+    print(f"\n  推論完成，共收集 {len(all_targets)} 個有效動作樣本")
+
+    if len(all_targets) == 0:
+        print("[錯誤] 沒有有效樣本可供評估")
+        sys.exit(1)
+
+    logits_t = torch.stack(all_logits)  # (N, 181)
+    targets_t = torch.tensor(all_targets, dtype=torch.long)  # (N,)
+
+    # ── 4. 計算準確率 ──
+    _print_accuracy_results(logits_t, targets_t, mask=None, top_k=args.top_k)
+
+
+def _print_accuracy_results(logits, targets, mask, top_k=False):
+    """共用的準確率計算與輸出。"""
     acc_results = compute_offline_accuracy(logits, targets, mask)
 
     print()
@@ -89,8 +210,7 @@ def run_offline_eval(args):
         else:
             print(f"    {cat:>8s} 準確率 : {val*100:.2f}%")
 
-    # 若有指定 top_k，也計算 Top-K
-    if args.top_k and mask is not None:
+    if top_k:
         detailed = compute_detailed_accuracy(logits, targets, mask)
         print()
         print("  Top-K 準確率:")
@@ -100,8 +220,6 @@ def run_offline_eval(args):
                 print(f"    Top-{k} Overall : {detailed[key]*100:.2f}%")
 
     print("=" * 60)
-
-    return acc_results
 
 
 # ============================================================================
@@ -212,23 +330,39 @@ def main():
         help="評估模式：offline（離線準確率）或 selfplay（自我對弈統計）"
     )
 
-    # --- 離線模式參數 ---
-    parser.add_argument("--logits", type=str,
-                        help="[offline] logits 的 .npy 檔案路徑")
-    parser.add_argument("--targets", type=str,
-                        help="[offline] target labels 的 .npy 檔案路徑")
+    # --- 離線模式參數（方式 A: 預存 .npy） ---
+    parser.add_argument("--logits", type=str, default=None,
+                        help="[offline-A] logits 的 .npy 檔案路徑")
+    parser.add_argument("--targets", type=str, default=None,
+                        help="[offline-A] target labels 的 .npy 檔案路徑")
     parser.add_argument("--mask", type=str, default=None,
-                        help="[offline] 合法動作遮罩的 .npy 檔案路徑（選填）")
+                        help="[offline-A] 合法動作遮罩的 .npy 檔案路徑（選填）")
+
+    # --- 離線模式參數（方式 B: 模型推論 + 資料集） ---
+    parser.add_argument("--data-path", type=str, default=None,
+                        help="[offline-B] 轉換後的資料集目錄路徑（如 /data/converted_features_npy）")
+    parser.add_argument("--val-split", type=float, default=0.2,
+                        help="[offline-B] 驗證集比例（預設 0.2，與 train_bc.py 一致）")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="[offline-B] 隨機種子（預設 42，與 train_bc.py 一致）")
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="[offline-B] 推論批次大小（預設 256）")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="[offline-B] DataLoader worker 數量（預設 4）")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="[offline-B] 每個 worker 預先載入的 batch 數量（預設 2）")
+
+    # --- 共用參數 ---
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="運算裝置（預設 cuda）")
     parser.add_argument("--top_k", action="store_true",
                         help="[offline] 是否同時計算 Top-3/Top-5 準確率")
 
     # --- 自我對弈模式參數 ---
-    parser.add_argument("--checkpoint", type=str,
-                        help="[selfplay] 模型 checkpoint .pt 路徑")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="模型 checkpoint .pt 路徑")
     parser.add_argument("--num_games", type=int, default=1000,
                         help="[selfplay] 自我對弈局數（預設 1000）")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="[selfplay] 運算裝置（預設 cuda）")
     parser.add_argument("--temperature", type=float, default=2.0,
                         help="[selfplay] 動作採樣溫度（預設 2.0）")
     parser.add_argument("--opponent_pool", type=int, default=5,
@@ -245,9 +379,17 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "offline":
-        if not args.logits or not args.targets:
-            parser.error("離線模式需要 --logits 和 --targets 參數")
-        run_offline_eval(args)
+        # 判斷使用方式 A（.npy）或方式 B（模型+資料集）
+        if args.checkpoint and args.data_path:
+            run_offline_eval_from_dataset(args)
+        elif args.logits and args.targets:
+            run_offline_eval(args)
+        else:
+            parser.error(
+                "離線模式需要以下其中一組參數：\n"
+                "  方式 A (預存 .npy):  --logits LOGITS --targets TARGETS\n"
+                "  方式 B (模型推論):   --checkpoint MODEL.pt --data-path /path/to/data"
+            )
 
     elif args.mode == "selfplay":
         if not args.checkpoint:
