@@ -361,6 +361,9 @@ def run_selfplay_eval(args):
                 device=args.mortal_device,
             )
 
+    # BC/Mortal 模式：對手池固定為 1（模型不變，多副本無意義）
+    opp_pool = 1 if (args.baseline_checkpoint or args.mortal_weights) else args.opponent_pool
+
     # 建立 Runner 與 Tracker
     eval_mode = getattr(args, "eval_mode", "attack")
     if not args.baseline_checkpoint and not args.mortal_weights:
@@ -371,7 +374,7 @@ def run_selfplay_eval(args):
     runner = SelfPlayRunner(
         agent_model,
         device=device,
-        opponent_pool_size=args.opponent_pool,
+        opponent_pool_size=opp_pool,
         train_mode=eval_mode,
         opponent_base_model=opponent_base_model,
         external_agents=external_agents if external_agents else None,
@@ -380,9 +383,9 @@ def run_selfplay_eval(args):
 
     num_games = args.num_games
     print(f"\n  開始對弈: {num_games} 局")
-    if not args.mortal_weights:
+    if not args.mortal_weights and not args.baseline_checkpoint:
         print(f"  Temperature: {args.temperature}")
-        print(f"  對手池大小: {args.opponent_pool}")
+        print(f"  對手池大小: {opp_pool}")
     else:
         print(f"  Temperature (PPO agent): {args.temperature}")
     print("-" * 40)
