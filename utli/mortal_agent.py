@@ -391,7 +391,9 @@ class MortalAgent:
                 return None
 
             if evt_type == ET.DRAW:
-                # DRAW 事件自己摸牌時可從 draws 取得；別人摸牌時跳過
+                # 自己摸牌：從 draws 取得 tile
+                # 他人摸牌：unknown tile "?"（libriichi 接受其他玩家的未知 tsumo）
+                # 必須發送所有玩家的 tsumo，否則 PlayerState 的 tsumo→dahai 對會被破壞
                 if actor == self.player_id:
                     try:
                         draws = obs.draws()
@@ -400,13 +402,7 @@ class MortalAgent:
                         tile = None
                     pai = _mjx_tile_to_mjai(tile) if tile else "?"
                 else:
-                    # 別人的摸牌：跳過（我們不知道他摸什麼）
-                    # 但為了 PlayerState 正確性，仍記錄摸牌事件
-                    # 使用 "?" 在某些情況可能導致後續 discard 出錯
-                    # 因此採用「記錄事件但 tile 設為 unknown」
-                    # PlayerState 收到 "?" 的 tsumo 後，會等待該玩家的 discard 來辨識 tile
-                    return None  # 跳過未知的他人摸牌
-
+                    pai = "?"
                 return json.dumps({"type": "tsumo", "actor": actor, "pai": pai})
 
             elif evt_type == ET.DISCARD:
