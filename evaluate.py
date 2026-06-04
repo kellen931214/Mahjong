@@ -345,32 +345,29 @@ def run_selfplay_eval(args):
     if args.baseline_checkpoint:
         opponent_base_model = _load_model(args.baseline_checkpoint, "Opponent (BC)")
         print(f"  🆚 PPO vs BC 對比模式：agent=PPO，對手=BC baseline")
-    elif args.mortal_weights:
-        print(f"  🆚 PPO vs Mortal 對比模式：agent=PPO，對手=Mortal")
-    else:
-        print(f"  🎮 自我對弈模式：所有玩家用同一模型")
 
     # 🆕 初始化外部 agents（Mortal 對比模式）
+    # 四個位置全部建立 MortalAgent，runner 會自動把 agent_pid 覆蓋為 PPO agent。
+    # 這樣無論 PPO 隨機坐到哪個位置，其餘三人保證都是 Mortal。
     external_agents = {}
     if args.mortal_weights:
         from utli.mortal_agent import MortalAgent
-        mortal_ids = [int(x.strip()) for x in args.mortal_player_ids.split(",")]
-        for pid in mortal_ids:
-            if pid == 0:
-                print(f"  ⚠️ 警告：Mortal agent 不可設為 player_0（agent 保留位），已跳過")
-                continue
-            print(f"  🤖 建立 MortalAgent (pid={pid}): {args.mortal_weights}")
-            mortal_agent = MortalAgent(
+        print(f"  🆚 PPO vs Mortal 對比模式：agent=PPO，對手=全部 Mortal")
+        for pid in range(4):
+            print(f"  🤖 建立 MortalAgent (pid={pid})")
+            external_agents[pid] = MortalAgent(
                 weights_path=args.mortal_weights,
                 player_id=pid,
                 device=args.mortal_device,
             )
-            external_agents[pid] = mortal_agent
-        print(f"  📋 外部 agent 配置: {list(external_agents.keys())}")
 
     # 建立 Runner 與 Tracker
     eval_mode = getattr(args, "eval_mode", "attack")
+    if not args.baseline_checkpoint and not args.mortal_weights:
+        print(f"  🎮 自我對弈模式：所有玩家用同一模型")
     print(f"  🌟 攻守模式: {eval_mode}")
+    if args.mortal_weights:
+        print(f"  📋 Mortal 對手：4 個位置全部預建，PPO agent 覆蓋其一，其餘 3 人皆為 Mortal")
     runner = SelfPlayRunner(
         agent_model,
         device=device,
@@ -382,9 +379,12 @@ def run_selfplay_eval(args):
     tracker = MahjongMetricTracker()
 
     num_games = args.num_games
-    print(f"\n  開始自我對弈: {num_games} 局")
-    print(f"  Temperature: {args.temperature}")
-    print(f"  對手池大小: {args.opponent_pool}")
+    print(f"\n  開始對弈: {num_games} 局")
+    if not args.mortal_weights:
+        print(f"  Temperature: {args.temperature}")
+        print(f"  對手池大小: {args.opponent_pool}")
+    else:
+        print(f"  Temperature (PPO agent): {args.temperature}")
     print("-" * 40)
 
     for game_idx in range(1, num_games + 1):
