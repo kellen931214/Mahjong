@@ -23,10 +23,12 @@ import traceback
 import numpy as np
 import torch
 
-# 將 Mortal 加入搜尋路徑（libriichi 動態庫與 mortal module）
-_MORTAL_DIR = Path(__file__).resolve().parent.parent / "Mortal"
-if str(_MORTAL_DIR) not in sys.path:
-    sys.path.insert(0, str(_MORTAL_DIR))
+# Mortal Python 模組路徑（mortal/model.py, mortal/engine.py 所在）
+_MORTAL_PKG_DIR = Path(__file__).resolve().parent.parent / "Mortal" / "mortal"
+# libriichi 已透過 maturin 安裝到 site-packages，無需特殊路徑處理
+# 確保 Mortal 套件可被導入，但不遮蔽已安裝的 libriichi
+if str(_MORTAL_PKG_DIR.parent) not in sys.path:
+    sys.path.append(str(_MORTAL_PKG_DIR.parent))
 
 
 class MortalAgent:
@@ -99,8 +101,8 @@ class MortalAgent:
         )
 
         # ── 初始化 libriichi PlayerState ──
-        from libriichi.state import PlayerState
-        self._state = PlayerState(player_id)
+        import libriichi as _lib
+        self._state = _lib.state.PlayerState(player_id)
 
         # 遊戲事件緩衝區（累積 mjai 事件以同步狀態）
         self._events: List[str] = []
@@ -144,7 +146,8 @@ class MortalAgent:
 
         # ── 3. 呼叫 MortalEngine.react_batch ──
         # 編碼 observation
-        from libriichi.state import PlayerState as PS
+        import libriichi as _lib
+        PS = _lib.state.PlayerState
         obs_arr, mask_arr = self._state.encode_obs(self.engine.version, at_kan_select=False)
 
         # Mortal 46 維動作空間的 mask
