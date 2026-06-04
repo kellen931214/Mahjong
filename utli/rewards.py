@@ -36,9 +36,9 @@ class MahjongRewardCalculator:
         },
         "defense": {
             "penalty_weight": 6.0,        # 重度放銃懲罰，逼迫絕對防守
-            "potential_weight": 0.01,     # 壓縮進攻獎勵至幾乎為 0
-            "dora_weight": 0.002,         # 視安全度可切出寶牌
-            "progression_weight": 0.005,  # 防守時向聽進展不再有意義
+            "potential_weight": 0.08,     # 攻擊的 20%，保留微弱進攻意識
+            "dora_weight": 0.005,         # 攻擊的 50%
+            "progression_weight": 0.025,  # 攻擊的 50%，強化向聽進展梯度
         },
     }
 
