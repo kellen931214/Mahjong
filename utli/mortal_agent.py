@@ -91,37 +91,60 @@ class MortalAgent:
         try: r = obs.round()
         except: r = -1
         if r != self._round:
-            self._st = self._lib.state.PlayerState(self.pid)
-            self._pending_draw = {}
             self._events = []
+            self._pending_draw = {}
             self._round = r
-            self._feed_start(obs)
 
-        # accumulate + process new events
+        # accumulate events
         mjx_evts = list(obs.events()) if hasattr(obs, "events") and obs.events() else []
-        new = mjx_evts[len(self._events):]
         self._events = mjx_evts
-        for evt in new:
-            self._feed_event(evt, obs)
 
-        # encode + infer
-        try:
-            arr, mask = self._st.encode_obs(self.ver, False)
-            acts, _, _, _ = self.eng.react_batch([arr], [mask], None)
-            ma = acts[0]
-        except Exception:
-            ma = 0
+        # ── encode with events; fall back to start-only if state corruption panics ──
+        ma = self._try_encode(obs)  # always returns a valid action index
         return self._to_mjx(ma, legals)
+
+    def _try_encode(self, obs):
+        """Try encoding with events. On panic (BaseException), fall back to start-only."""
+        try:
+            return self._encode_full(obs)
+        except BaseException:
+            # pyo3 PanicException extends BaseException, not Exception
+            # this catches state corruption panics
+            try:
+                return self._encode_start_only(obs)
+            except BaseException:
+                return 0
+
+    def _encode_full(self, obs):
+        st = self._lib.state.PlayerState(self.pid)
+        st.update(json.dumps({"type":"start_game","names":[f"p{i}" for i in range(4)]}))
+        st.update(self._kyoku_json(obs))
+        for evt in self._events:
+            self._feed_event_into(st, evt, obs)
+        arr, mask = st.encode_obs(self.ver, False)
+        acts, _, _, _ = self.eng.react_batch([arr], [mask], None)
+        return acts[0]
+
+    def _encode_start_only(self, obs):
+        st = self._lib.state.PlayerState(self.pid)
+        st.update(json.dumps({"type":"start_game","names":[f"p{i}" for i in range(4)]}))
+        st.update(self._kyoku_json(obs))
+        arr, mask = st.encode_obs(self.ver, False)
+        acts, _, _, _ = self.eng.react_batch([arr], [mask], None)
+        return acts[0]
 
     # ── event processing ──
 
     def _feed_start(self, obs):
         """send start_game + start_kyoku to PlayerState"""
-        self._st.update(json.dumps({"type":"start_game","names":[f"p{i}" for i in range(4)]}))
-        self._st.update(self._kyoku_json(obs))
+        try:
+            self._st.update(json.dumps({"type":"start_game","names":[f"p{i}" for i in range(4)]}))
+            self._st.update(self._kyoku_json(obs))
+        except Exception:
+            pass
 
-    def _feed_event(self, evt, obs):
-        """process one mjx event → may produce 0/1/2 mjai events"""
+    def _feed_event_into(self, st, evt, obs):
+        """feed one mjx event into a PlayerState, silently skipping failures"""
         from mjx.const import EventType as ET
         try:
             t = evt.type()
@@ -132,53 +155,55 @@ class MortalAgent:
         try:
             if t == ET.DRAW:
                 if a == self.pid:
-                    # own draw: real tile from obs.draws()
                     pai = _T[0]
                     try:
                         draws = obs.draws()
                         if draws: pai = _s(draws[-1])
                     except: pass
-                    self._update(json.dumps({"type":"tsumo","actor":a,"pai":pai}))
+                    try: st.update(json.dumps({"type":"tsumo","actor":a,"pai":pai}))
+                    except: pass
                 else:
-                    # other's draw: buffer it, don't emit yet
+                    # other's draw: buffer in pending, emit when discard comes
                     self._pending_draw[a] = True
 
             elif t in (ET.DISCARD, ET.TSUMOGIRI):
                 pai = _s(evt.tile())
                 ts = (t == ET.TSUMOGIRI)
                 if a != self.pid and self._pending_draw.get(a):
-                    # inject predictive tsumo before dahai
-                    self._update(json.dumps({"type":"tsumo","actor":a,"pai":pai}))
+                    try: st.update(json.dumps({"type":"tsumo","actor":a,"pai":pai}))
+                    except: pass
                     self._pending_draw[a] = False
-                self._update(json.dumps({"type":"dahai","actor":a,"pai":pai,"tsumogiri":ts}))
+                try: st.update(json.dumps({"type":"dahai","actor":a,"pai":pai,"tsumogiri":ts}))
+                except: pass
 
             elif t == ET.RIICHI:
-                self._update(json.dumps({"type":"reach","actor":a}))
+                try: st.update(json.dumps({"type":"reach","actor":a}))
+                except: pass
             elif t == ET.TSUMO:
-                self._update(json.dumps({"type":"hora","actor":a,"target":a}))
+                try: st.update(json.dumps({"type":"hora","actor":a,"target":a}))
+                except: pass
             elif t == ET.RON:
-                self._update(json.dumps({"type":"hora","actor":a,"target":(a+1)%4}))
+                try: st.update(json.dumps({"type":"hora","actor":a,"target":(a+1)%4}))
+                except: pass
             elif t == ET.NEW_DORA:
                 try: d = obs.doras()[-1]
                 except: d = _T[0]
-                self._update(json.dumps({"type":"dora","dora_marker":_s(d)}))
+                try: st.update(json.dumps({"type":"dora","dora_marker":_s(d)}))
+                except: pass
 
             elif t in (ET.ABORTIVE_DRAW_NORMAL, ET.ABORTIVE_DRAW_NAGASHI_MANGAN,
                        ET.ABORTIVE_DRAW_NINE_TERMINALS, ET.ABORTIVE_DRAW_FOUR_RIICHIS,
                        ET.ABORTIVE_DRAW_THREE_RONS, ET.ABORTIVE_DRAW_FOUR_KANS,
                        ET.ABORTIVE_DRAW_FOUR_WINDS):
-                self._update(json.dumps({"type":"ryukyoku"}))
+                try: st.update(json.dumps({"type":"ryukyoku"}))
+                except: pass
 
             elif t in (ET.CHI, ET.PON, ET.OPEN_KAN, ET.CLOSED_KAN, ET.ADDED_KAN):
                 line = self._meld_json(evt, t, a)
-                if line: self._update(line)
+                if line:
+                    try: st.update(line)
+                    except: pass
 
-        except Exception:
-            pass
-
-    def _update(self, line: str):
-        try:
-            self._st.update(line)
         except Exception:
             pass
 
