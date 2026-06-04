@@ -11,13 +11,20 @@ mortal_agent.py — Mortal 模型包裝器（增量化 + 預測式 tsumo）
   - 新的 kyoku：重置 PlayerState 並重播 start events
 """
 
-import json, sys
+import json, sys, os
 from pathlib import Path
 from typing import List, Optional, Dict
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import mjx
+
+# CRITICAL: libriichi uses Rayon for parallel feature encoding.
+# When state corruption causes a panic in a Rayon worker thread,
+# it kills the entire process. Setting RAYON_NUM_THREADS=1 forces
+# all work onto the calling thread, making panics catchable via
+# Python's except BaseException.
+os.environ.setdefault("RAYON_NUM_THREADS", "1")
 
 _MORTAL_DIR = Path(__file__).resolve().parent.parent / "Mortal"
 if str(_MORTAL_DIR) not in sys.path:
