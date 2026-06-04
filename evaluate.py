@@ -383,11 +383,9 @@ def run_selfplay_eval(args):
 
     num_games = args.num_games
     print(f"\n  開始對弈: {num_games} 局")
+    print(f"  PPO 決策模式: {'argmax (貪婪)' if args.temperature <= 0 else f'sampling (T={args.temperature})'}")
     if not args.mortal_weights and not args.baseline_checkpoint:
-        print(f"  Temperature: {args.temperature}")
         print(f"  對手池大小: {opp_pool}")
-    else:
-        print(f"  Temperature (PPO agent): {args.temperature}")
     print("-" * 40)
 
     for game_idx in range(1, num_games + 1):
@@ -484,8 +482,8 @@ def main():
                         help="模型 checkpoint .pt 路徑")
     parser.add_argument("--num_games", type=int, default=1000,
                         help="[selfplay] 自我對弈局數（預設 1000）")
-    parser.add_argument("--temperature", type=float, default=2.0,
-                        help="[selfplay] 動作採樣溫度（預設 2.0）")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="[selfplay] 動作採樣溫度，0=貪婪(argmax)，>0=隨機探索（訓練用，預設 0）")
     parser.add_argument("--opponent_pool", type=int, default=5,
                         help="[selfplay] 對手池大小（預設 5）")
     parser.add_argument("--pool_update_interval", type=int, default=50,

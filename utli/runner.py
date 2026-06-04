@@ -219,17 +219,24 @@ class SelfPlayRunner:
                             if 0 <= idx < len(mask):
                                 mask[idx] = logits[idx]
                                 legal_mask_bool[idx] = True
-                        probs = F.softmax(mask / temperature, dim=-1)
+
+                        # 溫度 ≤ 0 → 貪婪決策 (argmax)；溫度 > 0 → 隨機抽樣
+                        if temperature <= 0:
+                            action_idx = mask.argmax().item()
+                            probs = torch.zeros_like(mask)
+                            probs[action_idx] = 1.0
+                        else:
+                            probs = F.softmax(mask / temperature, dim=-1)
+                            if torch.isnan(probs).any() or torch.isinf(probs).any():
+                                probs = (
+                                    torch.ones(len(legal_indices), device=self.device)
+                                    / len(legal_indices)
+                                )
+                            action_idx = torch.multinomial(probs, 1).item()
                     else:
                         probs = torch.ones_like(logits) / len(logits)
+                        action_idx = 0
 
-                    if torch.isnan(probs).any() or torch.isinf(probs).any():
-                        probs = (
-                            torch.ones(len(legal_indices), device=self.device)
-                            / len(legal_indices)
-                        )
-
-                action_idx = torch.multinomial(probs, 1).item()
                 mjx_action = None
                 for a in legal_actions:
                     if hasattr(a, "to_idx") and a.to_idx() == action_idx:
