@@ -23,6 +23,10 @@ import traceback
 import numpy as np
 import torch
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import mjx
+
 # Mortal Python 模組路徑（mortal/model.py, mortal/engine.py 所在）
 _MORTAL_PKG_DIR = Path(__file__).resolve().parent.parent / "Mortal" / "mortal"
 # libriichi 已透過 maturin 安裝到 site-packages，無需特殊路徑處理
