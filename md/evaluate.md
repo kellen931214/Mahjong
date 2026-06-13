@@ -15,7 +15,5 @@
      * 和了率 (Win Rate)：自己胡牌的次數 / 總局數
      * 放銃率 (Deal-in Rate)：點炮給對手的次數 / 總局數
      * 順位分佈 (Placement Distribution)：統計獲得 1、2、3、4 名的精確百分比
-     * 讓我看到這局是和局還是有贏牌
 
 
-寫一個evaluate.py 和 存放指標函式的py 跑evaluate.py的時候 分成兩個mode我可以自由選擇要離線的或自我對弈的指標

@@ -16,7 +16,7 @@ NEG_INF = -1e9
 
 
 class SelfPlayRunner:
-    def __init__(self, model, device: str = "cuda", opponent_pool_size: int = 5, train_mode: str = "attack", opponent_base_model=None, external_agents=None):
+    def __init__(self, model, device: str = "cuda", opponent_pool_size: int = 5, train_mode: str = "attack", opponent_base_model=None, external_agents=None, reward_mode: str = "sparse"):
         """
         初始化自我博弈環境與對手池
 
@@ -31,21 +31,22 @@ class SelfPlayRunner:
             external_agents:       選填。dict[pid] = agent_object，用於注入外部 AI（如 MortalAgent）。
                                    agent 物件必須實作 act(obs) → mjx.Action 和 reset() 方法。
                                    當 player pid 有對應的外部 agent 時，使用外部 agent 而非 DecisionMamba 推論。
+            reward_mode:           "sparse" = 稀疏獎勵 (+1/0/-1)，"dense" = 密集 shaping 獎勵
         """
         if train_mode not in ("attack", "defense"):
             raise ValueError(f"train_mode 必須是 'attack' 或 'defense'，收到: {train_mode}")
+        if reward_mode not in ("sparse", "dense"):
+            raise ValueError(f"reward_mode 必須是 'sparse' 或 'dense'，收到: {reward_mode}")
         self.model = model.to(device)
         self.device = device
         self.env = MjxEnv()
-        # 🆕 對手池基底：agent 永遠是 self.model，對手池可用外部模型（如 BC baseline）
         self._opponent_base = opponent_base_model if opponent_base_model is not None else self.model
         self.opponent_pool = [copy.deepcopy(self._opponent_base).eval()]
         self.opponent_pool_size = opponent_pool_size
         self.train_mode = train_mode
+        self.reward_mode = reward_mode
         self.reward_calculator = create_default_calculator()
-        # 全程固定模式，不需要動態切換
         self.reward_calculator.set_mode(train_mode)
-        # 🆕 外部 agent 對照表（如 MortalAgent）
         self.external_agents = external_agents or {}
 
     def update_opponent_pool(self):
@@ -72,7 +73,10 @@ class SelfPlayRunner:
         """
         使用 MjxEnv 進行一局完整的遊戲對弈並收集軌跡。
 
-        全程使用 train_mode 指定的 reward 權重（攻擊 or 防守），不切換。
+        支援兩種 reward 模式（由 self.reward_mode 控制）：
+          - "sparse": 每步 reward = 0，round 結束時 agent 胡牌 = +1，放銃 = -1，其他 = 0
+          - "dense":  每步 shaping reward (potential + dora + progression)，
+                      終局有 penalty / backward reward 回溯
 
         🆕 每局牌（round）結束時獨立擷取 round_terminal，以 per-hand 語義
         累加 hand_results，供 MahjongMetricTracker 計算 Suphx 規範的和了率/放銃率
@@ -82,11 +86,9 @@ class SelfPlayRunner:
 
         Returns:
             (trajectories, game_result): 軌跡字典與遊戲結果摘要
-                game_result 新增 "hand_results" (List[Dict]) 和 "total_hands" (int)
         """
         obs_dict = self.env.reset()
 
-        # 🆕 重置外部 agent 狀態（如 MortalAgent）
         for pid, ext_agent in self.external_agents.items():
             if hasattr(ext_agent, 'reset'):
                 ext_agent.reset()
@@ -94,9 +96,6 @@ class SelfPlayRunner:
         agent_pid = random.choice([0, 1, 2, 3])
         agent_key = f"player_{agent_pid}"
 
-        # 🆕 決定每位玩家使用 DecisionMamba 還是外部 agent
-        # external_agents 優先：若外部 agent 存在則使用它，否則用 DecisionMamba
-        # agent_pid（我們訓練的模型）永遠使用 self.model（PPO agent）
         assigned_models = {}
         for pid in range(4):
             if pid == agent_pid:
@@ -109,19 +108,14 @@ class SelfPlayRunner:
         trajectories = {agent_pid: []}
         obs_histories = {pid: [] for pid in range(4)}
         timesteps_histories = {pid: [] for pid in range(4)}
-
         act_histories = {pid: [] for pid in range(4)}
         rtg_histories = {pid: [] for pid in range(4)}
         step_counts = {pid: 0 for pid in range(4)}
 
         MAX_CONTEXT_LEN = 128
-        step_log_counter = 0
         prev_shanten = None
         agent_has_won = False
 
-        # ── 🆕 Per-hand（每局牌）統計追蹤 ──
-        # 每個 round 獨立計數，用於 Suphx 論文規範的 per-hand 和了率/放銃率
-        # 分母 = 總局數（total_hands），而非總半莊數（total_games）
         hand_results: List[Dict] = []
         total_hands = 0
 
@@ -134,8 +128,7 @@ class SelfPlayRunner:
             if len(legal_actions) == 0:
                 break
 
-            # 提取 1380 維狀態（不做任何拼接）
-            state_tensor = self.extract_model_input(obs)  # (1380,)
+            state_tensor = self.extract_model_input(obs)
 
             # ── 時序對齊 ──
             max_act_len = MAX_CONTEXT_LEN - 1
@@ -143,7 +136,6 @@ class SelfPlayRunner:
             current_rtg_context = [1.0] + rtg_histories[current_pid][-max_act_len:]
 
             hist_len = min(len(obs_histories[current_pid]) + 1, MAX_CONTEXT_LEN)
-
             obs_context = (
                 obs_histories[current_pid][-(hist_len - 1):]
                 if hist_len > 1
@@ -187,30 +179,22 @@ class SelfPlayRunner:
             agent_type, agent_model = assigned_models[current_pid]
 
             if agent_type == "external":
-                # 🆕 使用外部 agent（如 MortalAgent）進行決策
                 mjx_action = agent_model.act(obs)
                 action_idx = mjx_action.to_idx() if hasattr(mjx_action, "to_idx") else 0
-
-                # 簡化：外部 agent 的 log_prob / probs 設為均勻分佈
-                # 因為我們不需要對 extern agent 收集訓練軌跡
                 probs = torch.ones(len(legal_indices), device=self.device) / len(legal_indices)
                 legal_mask_bool = torch.zeros(181, dtype=torch.bool, device=self.device)
                 for idx in legal_indices:
                     if 0 <= idx < 181:
                         legal_mask_bool[idx] = True
-
             else:
-                # 🧠 使用 DecisionMamba 模型推論（原有邏輯不變）
                 with torch.no_grad():
                     actor_logits, _, _, _ = agent_model(
                         seq_rtg, seq_state, seq_act, seq_time
                     )
                     logits = actor_logits[:, -1, :].squeeze(0)
-
                     legal_mask_bool = torch.zeros_like(
                         logits, dtype=torch.bool, device=self.device
                     )
-
                     if len(legal_indices) > 0:
                         mask = torch.full_like(
                             logits, NEG_INF, dtype=torch.float32, device=self.device
@@ -219,8 +203,6 @@ class SelfPlayRunner:
                             if 0 <= idx < len(mask):
                                 mask[idx] = logits[idx]
                                 legal_mask_bool[idx] = True
-
-                        # 溫度 ≤ 0 → 貪婪決策 (argmax)；溫度 > 0 → 隨機抽樣
                         if temperature <= 0:
                             action_idx = mask.argmax().item()
                             probs = torch.zeros_like(mask)
@@ -268,16 +250,20 @@ class SelfPlayRunner:
                 except:
                     log_prob = torch.tensor(0.0, device=self.device)
 
-                step_reward = self.reward_calculator.calculate_potential_reward(obs)
-                r_dora = self.reward_calculator.calculate_dora_potential_reward(obs)
-                step_reward += r_dora
-
-                curr_shanten = obs.curr_hand().shanten_number()
-                r_prog = self.reward_calculator.calculate_progression_reward(
-                    prev_shanten, curr_shanten
-                )
-                step_reward += r_prog
-                prev_shanten = curr_shanten
+                if self.reward_mode == "dense":
+                    # ── 密集 shaping reward（輔助梯度，壓縮至終局信號的 ~2%）──
+                    step_reward = self.reward_calculator.calculate_potential_reward(obs)
+                    step_reward += self.reward_calculator.calculate_dora_potential_reward(obs)
+                    curr_shanten = obs.curr_hand().shanten_number()
+                    step_reward += self.reward_calculator.calculate_progression_reward(
+                        prev_shanten, curr_shanten
+                    )
+                    prev_shanten = curr_shanten
+                    # 🆕 壓縮 shaping 量級：原始 ~0.35/步 → ~0.012/步，整局 ~3.5
+                    step_reward /= 30.0
+                else:
+                    # ── Sparse reward：每步 = 0 ──
+                    step_reward = 0.0
 
                 trajectories[agent_pid].append(
                     {
@@ -294,34 +280,30 @@ class SelfPlayRunner:
             step_counts[current_pid] += 1
             obs_dict = self.env.step({current_player_key: mjx_action})
 
-            # ── 🆕 Per-round 邊界偵測 ──
-            # 當 mjx 環境回報 done("round") 時，表示一局牌（hand）已結束。
-            # 從當前 observation 的 round_terminal proto 提取本局胡牌/放銃/流局狀態，
-            # 獨立打包為 hand_result，供 MahjongMetricTracker 以 per-hand 語義統計。
+            # ── Per-round 邊界偵測 ──
             if self.env.done("round"):
-                # 擷取任一玩家的 observation 以讀取 round_terminal（四人共享同一份終局資訊）
                 first_obs = next(iter(obs_dict.values()))
                 obs_proto = first_obs.to_proto()
 
                 if obs_proto.HasField("round_terminal"):
                     rt = obs_proto.round_terminal
-
-                    # 流局判定：優先使用 proto 原生 no_winner 欄位
-                    # RoundTerminal.no_winner 非 None 即為流局（含荒牌流局、九種九牌等）
                     is_draw = rt.HasField("no_winner")
-
-                    # 胡牌者清單（Win.who）
                     wins_this_hand = [w.who for w in rt.wins] if len(rt.wins) > 0 else []
-
-                    # agent 本局是否胡牌
                     agent_won = agent_pid in wins_this_hand
 
-                    # agent 本局是否放銃
-                    # 從 agent 視角的 observation events 中回溯 RON 事件來源
                     agent_obs = obs_dict.get(agent_key)
                     agent_dealt_in = False
                     if agent_obs is not None:
                         agent_dealt_in = self.reward_calculator.check_houjuu(agent_obs)
+
+                    if self.reward_mode == "sparse":
+                        # Sparse: 本局結果寫入該局最後一步
+                        if agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
+                            if agent_won:
+                                trajectories[agent_pid][-1]["reward"] = 1.0
+                            elif agent_dealt_in:
+                                trajectories[agent_pid][-1]["reward"] = -1.0
+                    # dense 模式不做 per-round 的 reward 賦值（後續終局結算處理）
 
                     hand_results.append({
                         "is_draw": is_draw,
@@ -330,10 +312,7 @@ class SelfPlayRunner:
                     })
                     total_hands += 1
 
-                # 新局開始：重置向聽追蹤（避免跨局殘留 prev_shanten）
                 prev_shanten = None
-
-
 
         # ── 終局結算 ──
         try:
@@ -356,7 +335,9 @@ class SelfPlayRunner:
             real_tens = [25000, 25000, 25000, 25000]
             final_state_proto = None
 
-        if agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
+        # ── dense 模式的終局回溯 reward ──
+        is_houjuu = False
+        if self.reward_mode == "dense" and agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
             final_obs = None
             if agent_key in obs_dict:
                 final_obs = obs_dict[agent_key]
@@ -373,11 +354,10 @@ class SelfPlayRunner:
                 penalty = self.reward_calculator.calculate_penalty_reward(
                     final_obs, best_opponent_delta
                 )
-                trajectories[agent_pid][-1]["reward"] += penalty
+                # 🆕 放大終局 penalty 權重 ×15（Dense: 終局信號主導，但不至於破壞 return 分佈）
+                trajectories[agent_pid][-1]["reward"] += penalty * 15.0
 
-            final_hand_info = self.reward_calculator.compute_winning_hand_info(
-                final_obs
-            )
+            final_hand_info = self.reward_calculator.compute_winning_hand_info(final_obs)
             if final_hand_info is not None and agent_score_delta > 0:
                 for step in trajectories[agent_pid]:
                     current_hand_34 = self.reward_calculator._get_current_hand_34(
@@ -386,11 +366,18 @@ class SelfPlayRunner:
                     r_back = self.reward_calculator.calculate_backward_reward(
                         final_hand_info, agent_score_delta, current_hand_34
                     )
-                    step["reward"] += r_back
+                    # 🆕 放大終局胡牌 backward reward ×15（Dense: 終局信號主導，但不至於破壞 return 分佈）
+                    step["reward"] += r_back * 15.0
             elif agent_score_delta <= 0:
                 for step in trajectories[agent_pid]:
-                    step["reward"] += -0.001
+                    # 🆕 未胡牌懲罰加強（-0.001 → -0.01）
+                    step["reward"] += -0.01
+        elif self.reward_mode == "sparse":
+            if hand_results:
+                is_houjuu = hand_results[-1].get("agent_deal_in", False)
 
+        # 清理 obs_raw
+        if agent_pid in trajectories:
             for step in trajectories[agent_pid]:
                 if "obs_raw" in step:
                     del step["obs_raw"]
@@ -403,7 +390,16 @@ class SelfPlayRunner:
         )
         agent_rank = sorted_pids.index(agent_pid) + 1
 
-        # ── 終局胡牌清單提取 ──
+        # 🆕 Sparse: 用整場遊戲勝負覆蓋最後一步 reward
+        # 確保每場遊戲一定有非零的終局信號（agent_rank==1 → +1, agent_rank==4 → -1, 其他 → 0）
+        if self.reward_mode == "sparse" and agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
+            if agent_rank == 1:
+                trajectories[agent_pid][-1]["reward"] = 1.0
+            elif agent_rank == 4:
+                trajectories[agent_pid][-1]["reward"] = -1.0
+            else:
+                trajectories[agent_pid][-1]["reward"] = 0.0
+
         wins_pids = []
         if (
             final_state_proto is not None
@@ -412,9 +408,6 @@ class SelfPlayRunner:
         ):
             wins_pids = [w.who for w in final_state_proto.round_terminal.wins]
 
-        # 🚀 互斥鎖定修正：當 final_state_proto 為 None（proto 解析失敗）時，
-        # 若 agent_has_won 已為 True，強制推斷 wins_pids 包含 agent_pid，
-        # 杜絕 wins += 1 與 draw_games += 1 同時觸發的統計矛盾。
         if final_state_proto is None and agent_has_won:
             wins_pids = [agent_pid]
 
@@ -429,7 +422,6 @@ class SelfPlayRunner:
             "is_agari": is_agari,
             "is_houjuu": is_houjuu,
             "anyone_agari": (len(wins_pids) > 0),
-            # 🆕 Per-hand 統計（用於 Suphx 論文規範的 per-hand 和了率/放銃率）
             "hand_results": hand_results,
             "total_hands": total_hands,
         }

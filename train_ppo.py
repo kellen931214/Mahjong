@@ -22,6 +22,7 @@ PPO 超參數：
 import torch
 import torch.optim as optim
 import numpy as np
+import copy
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -55,9 +56,11 @@ def train_ppo(
     train_mode: str = "attack",
     state_dim: int = 1380,
     max_ep_len: int = 2048,
+    num_trajectories: int = 32,
     # 🆕 LoRA PPO 超參數
-    temperature: float = 2.0,
-    entropy_coef: float = 0.05,
+    temperature: float = 0.8,
+    entropy_coef: float = 0.01,
+    reward_mode: str = "sparse",
     value_coef: float = 0.5,
     clip_epsilon: float = 0.2,
     max_grad_norm: float = 0.5,
@@ -116,6 +119,22 @@ def train_ppo(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   模型總參數量: {total_params:,}")
 
+    # ========== 🆕 2b. 載入獨立的 BC 模型作為對手池基底（凍結、不啟用 LoRA）==========
+    print(f"\n📂 載入 BC 對手基底模型: {bc_checkpoint_path}")
+    bc_opponent_model = DecisionMamba(
+        d_model=d_model,
+        action_dim=action_dim,
+        state_dim=state_dim,
+        max_ep_len=max_ep_len,
+    )
+    bc_opponent_model.load_state_dict(state_dict, strict=False)
+    bc_opponent_model = bc_opponent_model.to(device)
+    bc_opponent_model.eval()
+    # 🔒 凍結所有參數，對手永遠不更新
+    for param in bc_opponent_model.parameters():
+        param.requires_grad = False
+    print(f"   ✅ BC 對手基底模型載入完成（凍結，不啟用 LoRA）")
+
     # ========== 3. 啟用 LoRA：凍結 backbone，只訓練 LoRA + Actor/Critic head ==========
     print("\n🔒 啟用 LoRA 模式（凍結 Backbone，只訓練 LoRA 注入層 + Actor/Critic Head）...")
     model.prepare_for_ppo()
@@ -136,14 +155,16 @@ def train_ppo(
     print(f"   Optimizer 管理參數數量: {sum(p.numel() for group in optimizer.param_groups for p in group['params']):,}")
 
     # ========== 5. 建立 SelfPlayRunner ==========
-    print(f"\n🎮 初始化 SelfPlayRunner（對手池大小={opponent_pool_size}）...")
+    print(f"\n🎮 初始化 SelfPlayRunner（對手池大小={opponent_pool_size}，對手基底=BC）...")
     runner = SelfPlayRunner(
         model=model,
         device=str(device),
         opponent_pool_size=opponent_pool_size,
         train_mode=train_mode,
+        opponent_base_model=bc_opponent_model,
+        reward_mode=reward_mode,
     )
-    print(f"   ✅ Runner 初始化完成（train_mode={train_mode}）")
+    print(f"   ✅ Runner 初始化完成（train_mode={train_mode}，reward_mode={reward_mode}，對手永遠使用 BC 模型）")
 
     # ========== 6. 準備 Checkpoint 目錄與日誌 ==========
     checkpoint_dir = Path(checkpoint_dir)
@@ -161,6 +182,11 @@ def train_ppo(
         "agent_score": [],
         "is_win": [],
         "is_agari": [],
+        # 🆕 窗口平滑指標（方便繪圖）
+        "window_win_rate": [],
+        "window_agari_rate": [],
+        "window_avg_rank": [],
+        "window_avg_score": [],
     }
 
     # 🆕 滑動窗口緩衝區（用於計算近 N 局的贏牌率等統計）
@@ -195,23 +221,28 @@ def train_ppo(
             value_coef=value_coef,
             clip_epsilon=clip_epsilon,
             max_grad_norm=max_grad_norm,
-            num_trajectories=8,
+            num_trajectories=num_trajectories,
         )
 
         # -------- 7b. 記錄指標 --------
         for key in history:
             if key in metrics:
                 history[key].append(metrics[key])
-        # 🆕 遊戲結果欄位可能不在 old history keys 中，但已加入上方 dict
 
-        # -------- 7c. 🆕 累積遊戲結果到滑動窗口 --------
-        game_result = metrics.get("game_result", {})
-        if game_result:
-            history["agent_rank"].append(game_result.get("agent_rank", 3))
-            history["agent_score"].append(game_result.get("agent_score", 0))
-            history["is_win"].append(1 if game_result.get("is_win", False) else 0)
-            history["is_agari"].append(1 if game_result.get("is_agari", False) else 0)
-            game_window.append(game_result)
+        # -------- 7c. 🆕 累積全部 32 局結果到滑動窗口 --------
+        game_results = metrics.get("game_results", [])
+        if game_results:
+            last_game_result = game_results[-1]
+            # 把全部 32 局的結果都餵入 window
+            for gr in game_results:
+                if gr:
+                    history["agent_rank"].append(gr.get("agent_rank", 3))
+                    history["agent_score"].append(gr.get("agent_score", 0))
+                    history["is_win"].append(1 if gr.get("is_win", False) else 0)
+                    history["is_agari"].append(1 if gr.get("is_agari", False) else 0)
+                    game_window.append(gr)
+        else:
+            last_game_result = {}
 
         # -------- 7d. 定期輸出日誌 --------
         if iteration % log_every == 0:
@@ -242,15 +273,34 @@ def train_ppo(
                 f"和了率: {window_agari_rate:5.1f}% | "
                 f"均排名: {window_avg_rank:.2f} | "
                 f"均分數: {window_avg_score:7.0f} | "
-                f"上一局: 排名={game_result.get('agent_rank','?')} "
-                f"分數={game_result.get('agent_score','?'):.0f}pt "
-                f"{'🏆' if game_result.get('is_win') else ''}"
+                f"上一局: 排名={last_game_result.get('agent_rank','?')} "
+                f"分數={last_game_result.get('agent_score','?'):.0f}pt "
+                f"{'🏆' if last_game_result.get('is_win') else ''}"
             )
 
-        # -------- 7e. 更新對手池 --------
-        if iteration % update_opponent_every == 0:
-            print(f"🔄 Iter {iteration}: 更新對手池（當前大小={len(runner.opponent_pool)}）...")
-            runner.update_opponent_pool()
+        # -------- 7d2. 🆕 記錄滑動窗口統計（供繪圖用）--------
+        if len(game_window) > 0:
+            history["window_win_rate"].append(
+                sum(1 for g in game_window if g.get("is_win", False)) / len(game_window) * 100
+            )
+            history["window_agari_rate"].append(
+                sum(1 for g in game_window if g.get("is_agari", False)) / len(game_window) * 100
+            )
+            history["window_avg_rank"].append(
+                sum(g.get("agent_rank", 3) for g in game_window) / len(game_window)
+            )
+            history["window_avg_score"].append(
+                sum(g.get("agent_score", 0) for g in game_window) / len(game_window)
+            )
+        else:
+            history["window_win_rate"].append(0.0)
+            history["window_agari_rate"].append(0.0)
+            history["window_avg_rank"].append(3.0)
+            history["window_avg_score"].append(0.0)
+
+        # -------- 7e. 對手池（🆕 永遠使用 BC 模型，無需更新）--------
+        # 對手池基底已固定為 bc_opponent_model，永不更換
+        # 因此不再呼叫 runner.update_opponent_pool()
 
         # -------- 7f. 定期保存 Checkpoint --------
         if iteration % save_every == 0:
@@ -377,12 +427,12 @@ def main():
     )
     # 🆕 LoRA PPO 超參數
     parser.add_argument(
-        "--temperature", type=float, default=2.0,
-        help="Logit 採樣溫度（2.0~2.5，拉平極端分佈重新打開梯度通道）",
+        "--temperature", type=float, default=0.8,
+        help="Logit 採樣溫度（0.8，低溫度減少隨機性加速收斂）",
     )
     parser.add_argument(
-        "--entropy-coef", type=float, default=0.05,
-        help="策略熵係數（0.03~0.05，控制探索強度）",
+        "--entropy-coef", type=float, default=0.01,
+        help="策略熵係數（0.01，減少強制探索）",
     )
     parser.add_argument(
         "--value-coef", type=float, default=0.5,
@@ -443,6 +493,14 @@ def main():
         "--max-ep-len", type=int, default=2048,
         help="最大軌跡長度（用於 timestep embedding）",
     )
+    parser.add_argument(
+        "--reward-mode", type=str, default="sparse", choices=["sparse", "dense"],
+        help="獎勵模式：sparse=稀疏(+1/0/-1), dense=密集shaping（預設 sparse）",
+    )
+    parser.add_argument(
+        "--num-trajectories", type=int, default=32,
+        help="每 iteration 收集的軌跡數（8 或 32，8 較快但 32 較穩）",
+    )
 
     # ---- 隨機種子 ----
     parser.add_argument(
@@ -478,9 +536,11 @@ def main():
         max_ep_len=args.max_ep_len,
         temperature=args.temperature,
         entropy_coef=args.entropy_coef,
+        reward_mode=args.reward_mode,
         value_coef=args.value_coef,
         clip_epsilon=args.clip_epsilon,
         max_grad_norm=args.max_grad_norm,
+        num_trajectories=args.num_trajectories,
     )
 
 

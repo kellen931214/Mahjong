@@ -1,5 +1,5 @@
 """
-強化學習訓練函數 - 逐步獎勵版
+強化學習訓練函數 - 逐步獎勵版（Batch 化：Mamba 隱狀態在局間完全隔離）
 管理 PPO 訓練循環，包含軌跡收集、GAE 計算與 PPO 更新
 """
 import torch
@@ -23,238 +23,222 @@ def train_ppo_epoch(
     max_grad_norm=0.5,
     temperature=2.0,
     device="cuda",
-    num_trajectories=8,
+    num_trajectories=32,
 ):
     """
-    訓練一個 PPO epoch。軌跡收集與反向傳播全部 inline，確保每一步都在 with torch.no_grad() 外。
+    訓練一個 PPO epoch。收集 N 局軌跡，Batch 化輸入 Mamba 以確保跨局隱狀態隔離。
 
-    🆕 num_trajectories：每 iter 收集 N 條軌跡後合併更新。
-    多軌跡可降低梯度方差（中心極限定理：N 條軌跡的 gradient variance ≈ 1/N），
-    讓 PPO 更穩定、更易收斂。
+    🆕 Batch 化設計：
+      - 每局獨立收集軌跡
+      - Padding 到 N 局中的 max_seq_len
+      - Stack 成 (B, max_seq_len, ...) 送入 Mamba
+      - Mamba 在 batch 維度間 SSM 隱狀態互不干擾
+      - 用 valid_mask (B, max_seq_len) 排除 padding 位置的 loss
 
     Args:
         model: DecisionMamba 模型
         runner: SelfPlayRunner 實例
         optimizer: PyTorch Optimizer
-        epochs: PPO 更新 epoch 數（LoRA 建議 1，因數據只洗禮一次）
+        epochs: PPO 更新 epoch 數
         gamma: GAE 衰減係數
         lam: GAE λ 參數
-        clip_epsilon: PPO 剪裁範圍 ε（安全閥，防止極端獎勵拉偏 Policy）
-        value_coef: Value Loss 權重 c1（平衡 Critic 與 Actor 學習速度）
-        entropy_coef: 策略熵係數 c2（控制探索強度）
-        max_grad_norm: 梯度裁剪閾值（防止 GAE 劇烈變動導致梯度爆炸）
-        temperature: Logit 採樣溫度（Softmax 前除以係數，拉平極端分佈）
+        clip_epsilon: PPO 剪裁範圍 ε
+        value_coef: Value Loss 權重 c1
+        entropy_coef: 策略熵係數 c2
+        max_grad_norm: 梯度裁剪閾值
+        temperature: Logit 採樣溫度
         device: 計算設備
-        num_trajectories: 每 iter 收集的軌跡數（預設 8，降低梯度方差）
+        num_trajectories: 每 iter 收集的軌跡數
 
     Returns:
-        dict: {'policy_loss': float, 'value_loss': float, 'entropy': float,
-               'avg_reward': float, 'trajectory_length': float, 'game_result': dict}
+        dict: {'policy_loss', 'value_loss', 'entropy', 'avg_reward', 'trajectory_length', 'game_result'}
     """
     import torch.nn.functional as F
     import torch
     import numpy as np
     import random
-    from utli.rewards import create_default_calculator
-    from torch.distributions import Categorical
-    import mjx
 
     model.train()
     model.prepare_for_ppo()
 
-    all_trajectory_data = defaultdict(list)
+    # ── 🆕 收集 N 局軌跡，每局獨立儲存 ──
+    game_data = []  # list of dicts, each: {"obs": [(D,)], "action": [int], ...}
     total_reward = 0.0
     max_len = 0
-    game_lengths = []  # 🆕 追蹤每場遊戲的步數，用於 GAE / RTG 邊界重置
+    all_game_results = []
 
-    # ── 🆕 收集 N 條軌跡 ──
-    last_game_result = {}
     for traj_idx in range(num_trajectories):
         trajectories_dict, game_result = runner.run_match(temperature=temperature)
-        if traj_idx == num_trajectories - 1:
-            last_game_result = game_result
+        all_game_results.append(game_result)
 
-        game_step_count = 0
+        game_entry = {
+            "obs": [],
+            "action": [],
+            "reward": [],
+            "log_prob": [],
+            "timestep": [],
+            "legal_mask": [],
+        }
         for pid, pid_trajectories in trajectories_dict.items():
             if len(pid_trajectories) == 0:
                 continue
-
             for step_data in pid_trajectories:
-                all_trajectory_data["obs"].append(step_data["obs"].cpu().unsqueeze(0))
-                all_trajectory_data["action"].append(torch.tensor(step_data["action"], dtype=torch.long).unsqueeze(0))
-                all_trajectory_data["reward"].append(torch.tensor(step_data["reward"], dtype=torch.float32).unsqueeze(0))
-                all_trajectory_data["log_prob"].append(torch.tensor(step_data["log_prob"], dtype=torch.float32).unsqueeze(0))
-                all_trajectory_data["timestep"].append(torch.tensor(step_data["timestep"], dtype=torch.long).unsqueeze(0))
-                # 🚀 直接使用 runner 提供的 boolean legal_mask
-                legal_mask_i = step_data["mask"]
-                all_trajectory_data["legal_mask"].append(legal_mask_i.cpu().unsqueeze(0))
-                game_step_count += 1
+                game_entry["obs"].append(step_data["obs"].cpu())
+                game_entry["action"].append(step_data["action"])
+                game_entry["reward"].append(step_data["reward"])
+                game_entry["log_prob"].append(step_data["log_prob"])
+                game_entry["timestep"].append(step_data["timestep"])
+                game_entry["legal_mask"].append(step_data["mask"].cpu())
 
-            trajectory_len = len(pid_trajectories)
-            total_reward += pid_trajectories[-1]["reward"] if trajectory_len > 0 else 0.0
-            max_len = max(max_len, trajectory_len)
+        if len(game_entry["obs"]) == 0:
+            continue
 
-        game_lengths.append(game_step_count)
+        T = len(game_entry["obs"])
+        max_len = max(max_len, T)
+        total_reward += sum(game_entry["reward"])  # 🆕 整局總獎勵（非最後一步）
+        game_data.append(game_entry)
 
-    # 🆕 計算遊戲邊界索引（用於 GAE / RTG 在每局交界處重置）
-    boundary_set = set()
-    cumsum = 0
-    for gl in game_lengths[:-1]:  # 最後一局不需在末端重置
-        cumsum += gl
-        boundary_set.add(cumsum)
+    B = len(game_data)
+    if B == 0:
+        return {"policy_loss": 0, "value_loss": 0, "entropy": 0, "avg_reward": 0, "trajectory_length": 0, "game_results": []}
 
-    # 將每個 step 堆疊成完整軌跡張量
-    obs_sequence = torch.cat(all_trajectory_data["obs"]).unsqueeze(0)      # (1, seq_len, state_dim)
-    act_sequence = torch.cat(all_trajectory_data["action"]).unsqueeze(0)     # (1, seq_len)
-    reward_sequence = torch.cat(all_trajectory_data["reward"]).unsqueeze(0)  # (1, seq_len)
-    timestep_sequence = torch.cat(all_trajectory_data["timestep"]).unsqueeze(0)  # (1, seq_len)
-    log_prob_sequence = torch.cat(all_trajectory_data["log_prob"]).unsqueeze(0)  # (1, seq_len)
+    # ── 🆕 Padding + Stack 成 (B, max_seq_len, ...) ──
+    obs_pad = torch.zeros(B, max_len, 1380)
+    action_pad = torch.zeros(B, max_len, dtype=torch.long)
+    reward_pad = torch.zeros(B, max_len)
+    log_prob_pad = torch.zeros(B, max_len)
+    timestep_pad = torch.zeros(B, max_len, dtype=torch.long)
+    legal_mask_pad = torch.zeros(B, max_len, 181, dtype=torch.bool)
+    valid_mask = torch.zeros(B, max_len, dtype=torch.bool)  # True = 有效位置
 
-    # 🚀 legal_mask 使用 boolean，形狀為 (1, seq_len, action_dim)
-    legal_mask_sequence = torch.cat(all_trajectory_data["legal_mask"]).unsqueeze(0).bool()  # (1, seq_len, action_dim)
+    for i, g in enumerate(game_data):
+        T = len(g["obs"])
+        valid_mask[i, :T] = True
+        for t in range(T):
+            obs_pad[i, t] = g["obs"][t]
+            action_pad[i, t] = g["action"][t]
+            reward_pad[i, t] = g["reward"][t]
+            log_prob_pad[i, t] = g["log_prob"][t]
+            timestep_pad[i, t] = g["timestep"][t]
+            legal_mask_pad[i, t] = g["legal_mask"][t]
 
-    # 🔧【修正】rtg_sequence 需要最後一維為 1，與 BC 訓練時的形狀 (batch, seq_len, 1) 對齊
-    # 🆕 多軌跡時在遊戲交界處重置 running_rtg
-    seq_len = reward_sequence.shape[1]
-    rtg_sequence = torch.zeros_like(reward_sequence).unsqueeze(-1)  # (1, seq_len, 1)
-    running_rtg = 1.0
-    for t in range(seq_len - 1, -1, -1):
-        if t + 1 in boundary_set:
-            running_rtg = 1.0  # 🆕 遊戲交界處重置
-        running_rtg += reward_sequence[0, t].item()
-        rtg_sequence[0, t, 0] = running_rtg
+    # ── RTG 計算（每局獨立計算，padding 位置留 0）──
+    rtg_pad = torch.zeros(B, max_len, 1)
+    for i, g in enumerate(game_data):
+        T = len(g["obs"])
+        running_rtg = 1.0
+        for t in range(T - 1, -1, -1):
+            running_rtg += g["reward"][t]
+            rtg_pad[i, t, 0] = running_rtg
 
-    # ======================================================================
-    # 🚀 模型前向傳播：構造 Mamba 訓練所需的 Padded 輸入 (T+1 步)
-    # ======================================================================
-    # 1. act_sequence 形狀為 (1, T) -> padded 後變為 (1, T+1)
-    padded_act = torch.cat([act_sequence, torch.zeros(1, 1, dtype=torch.long)], dim=1) 
-    
-    # 2. rtg_sequence 形狀為 (1, T, 1) -> padded 後變為 (1, T+1, 1)
-    # 🔧【修正】rtg_padding_token 也必須是 (1, 1, 1) 以維持三維結構
-    rtg_padding_token = torch.ones(1, 1, 1) * 1.0  
-    padded_rtg = torch.cat([rtg_sequence, rtg_padding_token], dim=1)  
-    
-    # 3. timestep_sequence 形狀為 (1, T) -> padded 後變為 (1, T+1)
-    padded_timestep = torch.cat([timestep_sequence, torch.zeros(1, 1, dtype=torch.long)], dim=1) 
-    
-    # 4. obs_sequence 形狀為 (1, T, 1380) -> padded 後變為 (1, T+1, 1380)
-    obs_padding_token = torch.zeros(1, 1, obs_sequence.shape[-1])  # (1, 1, 1380)
-    padded_obs = torch.cat([obs_sequence, obs_padding_token], dim=1) 
+    # ── Padded 輸入（T+1 步，最後一位為 padding token）──
+    padded_act = torch.cat([action_pad, torch.zeros(B, 1, dtype=torch.long)], dim=1)  # (B, T+1)
+    padded_rtg = torch.cat([rtg_pad, torch.ones(B, 1, 1) * 1.0], dim=1)  # (B, T+1, 1)
+    padded_timestep = torch.cat([timestep_pad, torch.zeros(B, 1, dtype=torch.long)], dim=1)  # (B, T+1)
+    padded_obs = torch.cat([obs_pad, torch.zeros(B, 1, 1380)], dim=1)  # (B, T+1, 1380)
 
-    # ========================
-    # 搬移至設備與分配優化目標
-    # ========================
-    obs_sequence = obs_sequence.to(device)
-    act_sequence = act_sequence.to(device)
-    reward_sequence = reward_sequence.to(device)
-    timestep_sequence = timestep_sequence.to(device)
-    log_prob_sequence = log_prob_sequence.to(device)
-    legal_mask_sequence = legal_mask_sequence.to(device)
-    rtg_sequence = rtg_sequence.to(device)
+    # ── 搬移至設備 ──
+    obs_pad = obs_pad.to(device)
+    action_pad = action_pad.to(device)
+    reward_pad = reward_pad.to(device)
+    log_prob_pad = log_prob_pad.to(device)
+    timestep_pad = timestep_pad.to(device)
+    legal_mask_pad = legal_mask_pad.to(device)
+    valid_mask = valid_mask.to(device)
+    rtg_pad = rtg_pad.to(device)
 
     padded_act = padded_act.to(device)
     padded_rtg = padded_rtg.to(device)
     padded_timestep = padded_timestep.to(device)
     padded_obs = padded_obs.to(device)
 
-    target_actions = act_sequence          # (1, seq_len)
-    target_log_probs = log_prob_sequence   # (1, seq_len)
-    target_rewards = reward_sequence       # (1, seq_len)
-    target_legal_mask = legal_mask_sequence # (1, seq_len, action_dim)
+    target_actions = action_pad          # (B, T)
+    target_log_probs = log_prob_pad      # (B, T)
+    target_rewards = reward_pad          # (B, T)
+    target_legal_mask = legal_mask_pad   # (B, T, 181)
 
-    # ========================
-    # Value 計算（使用完整的 T+1 步 padded 輸入）
-    # ========================
+    # ── Value 計算（T+1 步 padded 輸入，最後一位用於 bootstrapping）──
     with torch.no_grad():
         model.eval()
         _, values_all, _, _ = model(padded_rtg, padded_obs, padded_act, padded_timestep)
         model.train()
-        values_all = values_all.squeeze(0).squeeze(-1)  # (seq_len + 1,)
+        values_all = values_all.squeeze(-1)  # (B, T+1)
 
-    # ========================
-    # GAE 計算（精準利用第 seq_len 個位置進行 Bootstrapping）
-    # ========================
-    seq_len = reward_sequence.shape[1] # 取得實體軌跡長度 T
-    advantages = torch.zeros_like(reward_sequence) # (1, seq_len)
-    gae = 0.0
-    
-    for t in reversed(range(seq_len)):
-        # 🚀 完美的自舉：t = seq_len-1 時，next_val = values_all[t + 1]，成功拿到了 Padding 步的預測價值！
-        next_val = values_all[t + 1] 
-        delta = reward_sequence[0, t] + gamma * next_val - values_all[t]
-        gae = delta + gamma * lam * gae
-        advantages[0, t] = gae
-        
-    # returns 的基準應該對齊前 seq_len 步 the 實體價值
-    returns = advantages + values_all[:seq_len]
+    # ── 🆕 GAE 逐局計算（Mamba 隱狀態不跨局，GAE 也不跨局）──
+    advantages = torch.zeros(B, max_len, device=device)
+    for i, g in enumerate(game_data):
+        T = len(g["obs"])
+        gae = 0.0
+        for t in range(T - 1, -1, -1):
+            next_val = values_all[i, t + 1]
+            delta = reward_pad[i, t] + gamma * next_val - values_all[i, t]
+            gae = delta + gamma * lam * gae
+            advantages[i, t] = gae
 
-    # ========================
-    # 🛡️ 標準化（含數量守衛，防止單元素 std() 返回 NaN）
-    # ========================
-    adv_mean = advantages.mean()
-    adv_std = advantages.std() if advantages.numel() > 1 else torch.tensor(0.0, device=device)
+    # returns = advantages + values（僅前 T 步）
+    returns = advantages + values_all[:, :max_len]  # (B, T)
+
+    # ── 標準化（僅在有效位置上計算）──
+    adv_flat = advantages[valid_mask]
+    adv_mean = adv_flat.mean()
+    adv_std = adv_flat.std() if adv_flat.numel() > 1 else torch.tensor(1.0, device=device)
     advantages = (advantages - adv_mean) / (adv_std + EPS)
 
-    # 🚀 不標準化 returns：讓 Critic 直接學習原始物理尺度，避免 per-trajectory
-    #    z-score 造成 non-stationary target（每個 iter 的 μ/σ 不同會使 value loss 劇烈震盪）。
-    #    改為保留 ret_std 供後續 value loss 自適應縮放（方案 A）。
-    ret_std = returns.std() if returns.numel() > 1 else torch.tensor(1.0, device=device)
+    # 🆕 Return Z-score normalization：讓 Critic 預測目標在 ~[-3, +3] 穩定範圍
+    #    取代 per-batch ret_std 除法，消除 Value Loss 因 batch 組成不同造成的劇烈跳動
+    ret_valid = returns[valid_mask]
+    ret_mean = ret_valid.mean()
+    ret_std = ret_valid.std() if ret_valid.numel() > 1 else torch.tensor(1.0, device=device)
+    returns_norm = (returns - ret_mean) / (ret_std + EPS)
 
-    # ========================
-    # PPO 更新迴圈
-    # ========================
+    # ── PPO 更新迴圈 ──
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
 
     for epoch in range(epochs):
-        # 前向：取得當前策略的 logits 和 values
         actor_logits, critic_values, _, _ = model(padded_rtg, padded_obs, padded_act, padded_timestep)
 
-        # 只取前 T 步的輸出（最後一個位置僅用於 value bootstrapping）
-        logits = actor_logits[:, :seq_len, :].squeeze(0)  # (T, action_dim)
-        new_values = critic_values[:, :seq_len, :].squeeze(0).squeeze(-1)  # (T,)
+        # 只取前 T 步的輸出
+        logits = actor_logits[:, :max_len, :]      # (B, T, 181)
+        new_values = critic_values[:, :max_len, :].squeeze(-1)  # (B, T)
 
-        # 🚀 使用大有限負數 NEG_INF 取代 float('-inf') 來做 action masking
-        legal_mask = target_legal_mask.squeeze(0)  # (T, action_dim), boolean
-        masked_logits = torch.where(legal_mask, logits, torch.tensor(NEG_INF, device=device))
+        # Action masking
+        masked_logits = torch.where(target_legal_mask, logits, torch.tensor(NEG_INF, device=device))
 
-        # 策略分佈與對數機率（套用 temperature 拉平極端 logit 分佈）
+        # Log probs
         log_probs = F.log_softmax(masked_logits / temperature, dim=-1)
-        new_log_probs = log_probs.gather(1, target_actions.squeeze(0).unsqueeze(1)).squeeze(1)  # (T,)
+        new_log_probs = log_probs.gather(2, target_actions.unsqueeze(-1)).squeeze(-1)  # (B, T)
 
         probs = F.softmax(masked_logits, dim=-1)
 
-        # 只對合法動作計算熵，避免大量「死 token」低估真實策略集中度
-        legal_probs = probs * legal_mask.float()
-        legal_log_probs = torch.where(legal_mask, log_probs, torch.tensor(0.0, device=device))
-        entropy = -(legal_probs * legal_log_probs).sum(dim=-1).mean()
+        # Entropy（僅有效位置）
+        legal_mask_float = target_legal_mask.float()
+        legal_probs = probs * legal_mask_float
+        legal_log_probs = torch.where(target_legal_mask, log_probs, torch.tensor(0.0, device=device))
+        ent_per_step = -(legal_probs * legal_log_probs).sum(dim=-1)  # (B, T)
+        entropy = (ent_per_step * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1)
 
-        # PPO 損失
-        ratio = torch.exp(new_log_probs - target_log_probs.squeeze(0))  # (T,)
-
-        # 🛡️ Ratio clamping：防止數值 overflow
+        # PPO ratio
+        ratio = torch.exp(new_log_probs - target_log_probs)  # (B, T)
         ratio = torch.clamp(ratio, 0.0, 10.0)
 
-        adv = advantages.squeeze(0)[:seq_len]
-        surr1 = ratio * adv  # (T,)
+        adv = advantages  # (B, T)
+        surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * adv
-        policy_loss = -torch.min(surr1, surr2).mean()
+        policy_loss_per_step = -torch.min(surr1, surr2)  # (B, T)
+        policy_loss = (policy_loss_per_step * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1)
 
-        # Value 損失（自適應縮放：除以 ret_std 讓 value loss 自動校準至
-        #    與 policy loss 相近的量級，高分大局自動降權，低分局自動升權）
-        value_loss_raw = F.mse_loss(new_values, returns.squeeze(0)[:seq_len])
-        value_loss = value_loss_raw / (ret_std.detach() + 1e-4)
+        # Value loss（returns_norm 已做 z-score 標準化，目標值穩定在 ~[-3,+3]）
+        value_diff = (new_values - returns_norm) ** 2  # (B, T)
+        value_loss = (value_diff * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1)
 
         # 總損失
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
-        # 反向傳播
         optimizer.zero_grad()
         loss.backward()
 
-        # 🛡️ 梯度裁剪前先檢查是否有 NaN 梯度
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
         optimizer.step()
@@ -266,11 +250,8 @@ def train_ppo_epoch(
     avg_policy_loss = total_policy_loss / epochs
     avg_value_loss = total_value_loss / epochs
     avg_entropy = total_entropy / epochs
-    avg_reward = total_reward / max(1, num_trajectories)
+    avg_reward = total_reward / max(1, B)
 
-    # ======================================================================
-    # 📊 🚀【新增列印段落】每個 Epoch 結束時將數據格式化輸出到終端機
-    # ======================================================================
     print(f"📈 [Epoch Metrics] "
           f"Policy Loss: {avg_policy_loss:8.4f} | "
           f"Value Loss: {avg_value_loss:8.4f} | "
@@ -284,5 +265,5 @@ def train_ppo_epoch(
         "entropy": avg_entropy,
         "avg_reward": avg_reward,
         "trajectory_length": max_len,
-        "game_result": last_game_result,
+        "game_results": all_game_results,
     }

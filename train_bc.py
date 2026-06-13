@@ -16,7 +16,7 @@ import argparse
 # 📌 確保從你的本地模組正確導入
 from dataset import BehavioralCloningDataset, bc_collate_fn
 from model import DecisionMamba
-from train_bc_step import train_bc_step
+from utli.train_bc_step import train_bc_step
 
 
 # ==================== 訓練函數 ====================
