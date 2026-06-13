@@ -174,8 +174,32 @@ def train_ppo(
     history = {
         "policy_loss": [],
         "value_loss": [],
+        "kl": [],
+        "clip_fraction": [],
         "entropy": [],
         "avg_reward": [],
+        "total_reward_mean": [],
+        "total_reward_std": [],
+        "total_reward_p95": [],
+        "total_reward_p99": [],
+        "shape_reward_mean": [],
+        "shape_reward_std": [],
+        "score_reward_mean": [],
+        "score_reward_std": [],
+        "hand_end_event_reward_mean": [],
+        "hand_end_event_reward_std": [],
+        "game_end_reward_mean": [],
+        "game_end_reward_std": [],
+        "advantage_mean": [],
+        "advantage_std": [],
+        "advantage_max_abs": [],
+        "average_rank": [],
+        "average_point_delta": [],
+        "deal_in_rate": [],
+        "win_rate": [],
+        "riichi_rate": [],
+        "call_rate": [],
+        "tenpai_rate": [],
         "trajectory_length": [],
         # 🆕 遊戲結果指標
         "agent_rank": [],
@@ -262,9 +286,39 @@ def train_ppo(
                 f"📊 Iter {iteration:>5d}/{num_iterations} | "
                 f"Policy Loss: {metrics['policy_loss']:.4f} | "
                 f"Value Loss: {metrics['value_loss']:.4f} | "
+                f"KL: {metrics['kl']:.5f} | "
+                f"Clip: {metrics['clip_fraction']:.3f} | "
                 f"Entropy: {metrics['entropy']:.4f} | "
                 f"Avg Reward: {metrics['avg_reward']:.4f} | "
                 f"Traj Len: {metrics['trajectory_length']:.1f}"
+            )
+            print(
+                f"🎯 Reward/Adv | "
+                f"total={metrics['total_reward_mean']:.4f}"
+                f"±{metrics['total_reward_std']:.4f} "
+                f"p95={metrics['total_reward_p95']:.4f} "
+                f"p99={metrics['total_reward_p99']:.4f} | "
+                f"shape={metrics['shape_reward_mean']:.4f}"
+                f"±{metrics['shape_reward_std']:.4f} | "
+                f"score={metrics['score_reward_mean']:.4f}"
+                f"±{metrics['score_reward_std']:.4f} | "
+                f"event={metrics['hand_end_event_reward_mean']:.4f}"
+                f"±{metrics['hand_end_event_reward_std']:.4f} | "
+                f"game={metrics['game_end_reward_mean']:.4f}"
+                f"±{metrics['game_end_reward_std']:.4f} | "
+                f"adv={metrics['advantage_mean']:.4f}"
+                f"±{metrics['advantage_std']:.4f} "
+                f"max={metrics['advantage_max_abs']:.4f}"
+            )
+            print(
+                f"🀄 Rollout | "
+                f"均排名={metrics['average_rank']:.3f} | "
+                f"均點差={metrics['average_point_delta']:.1f} | "
+                f"和牌率={metrics['win_rate'] * 100:.2f}% | "
+                f"放銃率={metrics['deal_in_rate'] * 100:.2f}% | "
+                f"立直率={metrics['riichi_rate'] * 100:.2f}% | "
+                f"副露率={metrics['call_rate'] * 100:.2f}% | "
+                f"流局聽牌率={metrics['tenpai_rate'] * 100:.2f}%"
             )
             # 🆕 遊戲結果摘要（滑動窗口）
             print(
@@ -487,7 +541,7 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, default="attack", choices=["attack", "defense"],
-        help="訓練模式: attack=進攻 reward（預設）, defense=防守 reward",
+        help="相容參數；attack/defense 皆映射到 unified reward",
     )
     parser.add_argument(
         "--max-ep-len", type=int, default=2048,
@@ -495,7 +549,7 @@ def main():
     )
     parser.add_argument(
         "--reward-mode", type=str, default="sparse", choices=["sparse", "dense"],
-        help="獎勵模式：sparse=稀疏(+1/0/-1), dense=密集shaping（預設 sparse）",
+        help="相容參數；sparse/dense 皆映射到 unified reward",
     )
     parser.add_argument(
         "--num-trajectories", type=int, default=32,

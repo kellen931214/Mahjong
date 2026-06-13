@@ -75,6 +75,7 @@ def train_ppo_epoch(
             "obs": [],
             "action": [],
             "reward": [],
+            "reward_components": [],
             "log_prob": [],
             "timestep": [],
             "legal_mask": [],
@@ -86,6 +87,9 @@ def train_ppo_epoch(
                 game_entry["obs"].append(step_data["obs"].cpu())
                 game_entry["action"].append(step_data["action"])
                 game_entry["reward"].append(step_data["reward"])
+                game_entry["reward_components"].append(
+                    step_data["reward_components"]
+                )
                 game_entry["log_prob"].append(step_data["log_prob"])
                 game_entry["timestep"].append(step_data["timestep"])
                 game_entry["legal_mask"].append(step_data["mask"].cpu())
@@ -100,7 +104,42 @@ def train_ppo_epoch(
 
     B = len(game_data)
     if B == 0:
-        return {"policy_loss": 0, "value_loss": 0, "entropy": 0, "avg_reward": 0, "trajectory_length": 0, "game_results": []}
+        zero_metrics = {
+            name: 0.0
+            for name in (
+                "policy_loss",
+                "value_loss",
+                "kl",
+                "clip_fraction",
+                "entropy",
+                "avg_reward",
+                "total_reward_mean",
+                "total_reward_std",
+                "total_reward_p95",
+                "total_reward_p99",
+                "shape_reward_mean",
+                "shape_reward_std",
+                "score_reward_mean",
+                "score_reward_std",
+                "hand_end_event_reward_mean",
+                "hand_end_event_reward_std",
+                "game_end_reward_mean",
+                "game_end_reward_std",
+                "advantage_mean",
+                "advantage_std",
+                "advantage_max_abs",
+                "average_rank",
+                "average_point_delta",
+                "deal_in_rate",
+                "win_rate",
+                "riichi_rate",
+                "call_rate",
+                "tenpai_rate",
+                "trajectory_length",
+            )
+        }
+        zero_metrics["game_results"] = all_game_results
+        return zero_metrics
 
     # ── 🆕 Padding + Stack 成 (B, max_seq_len, ...) ──
     obs_pad = torch.zeros(B, max_len, 1380)
@@ -122,13 +161,13 @@ def train_ppo_epoch(
             timestep_pad[i, t] = g["timestep"][t]
             legal_mask_pad[i, t] = g["legal_mask"][t]
 
-    # ── RTG 計算（每局獨立計算，padding 位置留 0）──
+    # ── RTG 計算（完整半莊內折扣，padding 位置留 0）──
     rtg_pad = torch.zeros(B, max_len, 1)
     for i, g in enumerate(game_data):
         T = len(g["obs"])
-        running_rtg = 1.0
+        running_rtg = 0.0
         for t in range(T - 1, -1, -1):
-            running_rtg += g["reward"][t]
+            running_rtg = g["reward"][t] + gamma * running_rtg
             rtg_pad[i, t, 0] = running_rtg
 
     # ── Padded 輸入（T+1 步，最後一位為 padding token）──
@@ -182,6 +221,7 @@ def train_ppo_epoch(
     adv_flat = advantages[valid_mask]
     adv_mean = adv_flat.mean()
     adv_std = adv_flat.std() if adv_flat.numel() > 1 else torch.tensor(1.0, device=device)
+    advantage_max_abs = adv_flat.abs().max()
     advantages = (advantages - adv_mean) / (adv_std + EPS)
 
     # 🆕 Return Z-score normalization：讓 Critic 預測目標在 ~[-3, +3] 穩定範圍
@@ -195,6 +235,8 @@ def train_ppo_epoch(
     total_policy_loss = 0.0
     total_value_loss = 0.0
     total_entropy = 0.0
+    total_kl = 0.0
+    total_clip_fraction = 0.0
 
     for epoch in range(epochs):
         actor_logits, critic_values, _, _ = model(padded_rtg, padded_obs, padded_act, padded_timestep)
@@ -222,6 +264,15 @@ def train_ppo_epoch(
         # PPO ratio
         ratio = torch.exp(new_log_probs - target_log_probs)  # (B, T)
         ratio = torch.clamp(ratio, 0.0, 10.0)
+        log_ratio = new_log_probs - target_log_probs
+        approx_kl_per_step = (ratio - 1.0) - log_ratio
+        approx_kl = (
+            approx_kl_per_step * valid_mask.float()
+        ).sum() / valid_mask.float().sum().clamp(min=1)
+        clip_fraction = (
+            ((ratio - 1.0).abs() > clip_epsilon).float()
+            * valid_mask.float()
+        ).sum() / valid_mask.float().sum().clamp(min=1)
 
         adv = advantages  # (B, T)
         surr1 = ratio * adv
@@ -246,15 +297,53 @@ def train_ppo_epoch(
         total_policy_loss += policy_loss.item()
         total_value_loss += value_loss.item()
         total_entropy += entropy.item()
+        total_kl += approx_kl.item()
+        total_clip_fraction += clip_fraction.item()
 
     avg_policy_loss = total_policy_loss / epochs
     avg_value_loss = total_value_loss / epochs
     avg_entropy = total_entropy / epochs
+    avg_kl = total_kl / epochs
+    avg_clip_fraction = total_clip_fraction / epochs
     avg_reward = total_reward / max(1, B)
+
+    component_values = {
+        name: np.asarray(
+            [
+                step_components[name]
+                for game in game_data
+                for step_components in game["reward_components"]
+            ],
+            dtype=np.float64,
+        )
+        for name in ("shape", "score", "event", "game")
+    }
+    reward_values = np.asarray(
+        [reward for game in game_data for reward in game["reward"]],
+        dtype=np.float64,
+    )
+
+    hand_results = [
+        hand
+        for result in all_game_results
+        for hand in result.get("hand_results", [])
+    ]
+    total_hands = len(hand_results)
+    tenpai_opportunities = sum(
+        int(hand.get("tenpai_opportunity", False)) for hand in hand_results
+    )
+
+    def _mean(values):
+        return float(np.mean(values)) if len(values) else 0.0
+
+    def _std(values):
+        return float(np.std(values)) if len(values) else 0.0
 
     print(f"📈 [Epoch Metrics] "
           f"Policy Loss: {avg_policy_loss:8.4f} | "
           f"Value Loss: {avg_value_loss:8.4f} | "
+          f"KL: {avg_kl:7.5f} | "
+          f"Clip: {avg_clip_fraction:6.3f} | "
           f"Entropy: {avg_entropy:6.4f} | "
           f"Avg Reward: {avg_reward:7.2f} | "
           f"Steps: {max_len:4d}")
@@ -262,8 +351,59 @@ def train_ppo_epoch(
     return {
         "policy_loss": avg_policy_loss,
         "value_loss": avg_value_loss,
+        "kl": avg_kl,
+        "clip_fraction": avg_clip_fraction,
         "entropy": avg_entropy,
         "avg_reward": avg_reward,
+        "total_reward_mean": _mean(reward_values),
+        "total_reward_std": _std(reward_values),
+        "total_reward_p95": (
+            float(np.percentile(reward_values, 95))
+            if len(reward_values)
+            else 0.0
+        ),
+        "total_reward_p99": (
+            float(np.percentile(reward_values, 99))
+            if len(reward_values)
+            else 0.0
+        ),
+        "shape_reward_mean": _mean(component_values["shape"]),
+        "shape_reward_std": _std(component_values["shape"]),
+        "score_reward_mean": _mean(component_values["score"]),
+        "score_reward_std": _std(component_values["score"]),
+        "hand_end_event_reward_mean": _mean(component_values["event"]),
+        "hand_end_event_reward_std": _std(component_values["event"]),
+        "game_end_reward_mean": _mean(component_values["game"]),
+        "game_end_reward_std": _std(component_values["game"]),
+        "advantage_mean": float(adv_mean.item()),
+        "advantage_std": float(adv_std.item()),
+        "advantage_max_abs": float(advantage_max_abs.item()),
+        "average_rank": _mean(
+            [result.get("agent_rank", 0) for result in all_game_results]
+        ),
+        "average_point_delta": _mean(
+            [result.get("point_delta", 0) for result in all_game_results]
+        ),
+        "deal_in_rate": (
+            sum(int(hand.get("agent_deal_in", False)) for hand in hand_results)
+            / max(total_hands, 1)
+        ),
+        "win_rate": (
+            sum(int(hand.get("agent_won", False)) for hand in hand_results)
+            / max(total_hands, 1)
+        ),
+        "riichi_rate": (
+            sum(int(hand.get("agent_riichi", False)) for hand in hand_results)
+            / max(total_hands, 1)
+        ),
+        "call_rate": (
+            sum(int(hand.get("agent_called", False)) for hand in hand_results)
+            / max(total_hands, 1)
+        ),
+        "tenpai_rate": (
+            sum(int(hand.get("agent_tenpai", False)) for hand in hand_results)
+            / max(tenpai_opportunities, 1)
+        ),
         "trajectory_length": max_len,
         "game_results": all_game_results,
     }

@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
 from mjx.env import MjxEnv
-from mjx.const import ActionType
-import numpy as np
+from mjx.const import EventType
 from torch.distributions import Categorical
 import copy
 import random
@@ -24,14 +23,14 @@ class SelfPlayRunner:
             model:                 DecisionMamba 模型（已載入權重）
             device:                計算設備（"cuda" 或 "cpu"）
             opponent_pool_size:    對手池上限（保留最近 N 代歷史模型用於對抗訓練）
-            train_mode:            "attack" = 使用進攻 reward 訓練 / "defense" = 使用防守 reward 訓練
+            train_mode:            保留 attack / defense CLI 相容性，兩者皆使用 unified reward
             opponent_base_model:   對手基底模型（選填）。若提供，對手池以此模型為基底；
                                    若為 None，對手池以 self.model 的複本為基底（自我對弈）。
                                    用於 PPO vs BC 對比評估：agent 用 model，對手用 BC baseline。
             external_agents:       選填。dict[pid] = agent_object，用於注入外部 AI（如 MortalAgent）。
                                    agent 物件必須實作 act(obs) → mjx.Action 和 reset() 方法。
                                    當 player pid 有對應的外部 agent 時，使用外部 agent 而非 DecisionMamba 推論。
-            reward_mode:           "sparse" = 稀疏獎勵 (+1/0/-1)，"dense" = 密集 shaping 獎勵
+            reward_mode:           保留 sparse / dense CLI 相容性，兩者皆使用 unified reward
         """
         if train_mode not in ("attack", "defense"):
             raise ValueError(f"train_mode 必須是 'attack' 或 'defense'，收到: {train_mode}")
@@ -48,6 +47,14 @@ class SelfPlayRunner:
         self.reward_calculator = create_default_calculator()
         self.reward_calculator.set_mode(train_mode)
         self.external_agents = external_agents or {}
+
+    def _add_reward_components(self, step: Dict, **components: float) -> None:
+        reward_components = step["reward_components"]
+        for name, value in components.items():
+            reward_components[name] += float(value)
+        step["reward"] = self.reward_calculator.combine_rewards(
+            **reward_components
+        )
 
     def update_opponent_pool(self):
         """
@@ -73,10 +80,8 @@ class SelfPlayRunner:
         """
         使用 MjxEnv 進行一局完整的遊戲對弈並收集軌跡。
 
-        支援兩種 reward 模式（由 self.reward_mode 控制）：
-          - "sparse": 每步 reward = 0，round 結束時 agent 胡牌 = +1，放銃 = -1，其他 = 0
-          - "dense":  每步 shaping reward (potential + dora + progression)，
-                      終局有 penalty / backward reward 回溯
+        train_mode 與 reward_mode 僅保留參數相容性。所有 rollout 都使用
+        unified shape + score delta + hand event + game end reward。
 
         🆕 每局牌（round）結束時獨立擷取 round_terminal，以 per-hand 語義
         累加 hand_results，供 MahjongMetricTracker 計算 Suphx 規範的和了率/放銃率
@@ -94,7 +99,6 @@ class SelfPlayRunner:
                 ext_agent.reset()
 
         agent_pid = random.choice([0, 1, 2, 3])
-        agent_key = f"player_{agent_pid}"
 
         assigned_models = {}
         for pid in range(4):
@@ -113,11 +117,12 @@ class SelfPlayRunner:
         step_counts = {pid: 0 for pid in range(4)}
 
         MAX_CONTEXT_LEN = 128
-        prev_shanten = None
-        agent_has_won = False
+        last_agent_obs = None
+        hand_start_step = 0
 
         hand_results: List[Dict] = []
         total_hands = 0
+        anyone_agari = False
 
         while not self.env.done("game"):
             current_player_key = list(obs_dict.keys())[0]
@@ -127,6 +132,14 @@ class SelfPlayRunner:
             legal_actions = obs.legal_actions()
             if len(legal_actions) == 0:
                 break
+
+            # Round terminal observations only carry a DUMMY action used to
+            # advance the environment. They are not agent decision steps.
+            if obs.to_proto().HasField("round_terminal"):
+                obs_dict = self.env.step(
+                    {current_player_key: legal_actions[0]}
+                )
+                continue
 
             state_tensor = self.extract_model_input(obs)
 
@@ -235,47 +248,44 @@ class SelfPlayRunner:
             act_histories[current_pid].append(action_idx)
             rtg_histories[current_pid].append(1.0)
 
-            if mjx_action.type() == ActionType.TSUMO and current_pid == agent_pid:
-                agent_has_won = True
-            elif mjx_action.type() == ActionType.RON and current_pid == agent_pid:
-                agent_has_won = True
-
             # ── 收集 agent 軌跡 ──
             if current_pid == agent_pid:
+                if last_agent_obs is not None:
+                    same_hand = self.reward_calculator.observations_in_same_hand(
+                        last_agent_obs, obs
+                    )
+                    transition = self.reward_calculator.compute_transition_reward(
+                        last_agent_obs, obs, same_hand
+                    )
+                    self._add_reward_components(
+                        trajectories[agent_pid][-1],
+                        shape=transition["shape"],
+                        score=transition["score"],
+                    )
+
                 try:
                     dist = Categorical(probs=probs)
                     log_prob = dist.log_prob(
                         torch.tensor(action_idx, device=self.device)
                     )
-                except:
+                except Exception:
                     log_prob = torch.tensor(0.0, device=self.device)
-
-                if self.reward_mode == "dense":
-                    # ── 密集 shaping reward（輔助梯度，壓縮至終局信號的 ~2%）──
-                    step_reward = self.reward_calculator.calculate_potential_reward(obs)
-                    step_reward += self.reward_calculator.calculate_dora_potential_reward(obs)
-                    curr_shanten = obs.curr_hand().shanten_number()
-                    step_reward += self.reward_calculator.calculate_progression_reward(
-                        prev_shanten, curr_shanten
-                    )
-                    prev_shanten = curr_shanten
-                    # 🆕 壓縮 shaping 量級：原始 ~0.35/步 → ~0.012/步，整局 ~3.5
-                    step_reward /= 30.0
-                else:
-                    # ── Sparse reward：每步 = 0 ──
-                    step_reward = 0.0
 
                 trajectories[agent_pid].append(
                     {
                         "obs": state_tensor.cpu(),
                         "action": action_idx,
                         "log_prob": log_prob.item(),
-                        "reward": step_reward,
+                        "reward": 0.0,
+                        "reward_components": (
+                            self.reward_calculator.empty_components()
+                        ),
                         "timestep": step_counts[current_pid],
                         "mask": legal_mask_bool.cpu(),
                         "obs_raw": obs,
                     }
                 )
+                last_agent_obs = obs
 
             step_counts[current_pid] += 1
             obs_dict = self.env.step({current_player_key: mjx_action})
@@ -290,36 +300,94 @@ class SelfPlayRunner:
                     is_draw = rt.HasField("no_winner")
                     wins_this_hand = [w.who for w in rt.wins] if len(rt.wins) > 0 else []
                     agent_won = agent_pid in wins_this_hand
+                    event_info = (
+                        self.reward_calculator.build_hand_end_event_info(
+                            rt,
+                            list(obs_proto.public_observation.events),
+                            agent_pid,
+                        )
+                    )
+                    agent_dealt_in = event_info["deal_in"]
+                    agent_tenpai = event_info[
+                        "exhaustive_draw_and_tenpai"
+                    ]
+                    exhaustive_draw = (
+                        event_info["exhaustive_draw_and_tenpai"]
+                        or event_info["exhaustive_draw_and_noten"]
+                    )
+                    events = list(obs_proto.public_observation.events)
+                    agent_riichi = any(
+                        event.type == int(EventType.RIICHI)
+                        and event.who == agent_pid
+                        for event in events
+                    )
+                    agent_called = any(
+                        event.type
+                        in (
+                            int(EventType.CHI),
+                            int(EventType.PON),
+                            int(EventType.OPEN_KAN),
+                        )
+                        and event.who == agent_pid
+                        for event in events
+                    )
 
-                    agent_obs = obs_dict.get(agent_key)
-                    agent_dealt_in = False
-                    if agent_obs is not None:
-                        agent_dealt_in = self.reward_calculator.check_houjuu(agent_obs)
+                    has_agent_step = len(trajectories[agent_pid]) > hand_start_step
+                    if has_agent_step and last_agent_obs is not None:
+                        final_score = int(rt.final_score.tens[agent_pid])
+                        terminal_score_reward = (
+                            self.reward_calculator.compute_score_delta_reward(
+                                self.reward_calculator.extract_player_score(
+                                    last_agent_obs, agent_pid
+                                ),
+                                final_score,
+                            )
+                        )
+                        event_reward = (
+                            self.reward_calculator.compute_hand_end_event_reward(
+                                event_info
+                            )
+                        )
+                        self._add_reward_components(
+                            trajectories[agent_pid][-1],
+                            score=terminal_score_reward,
+                            event=event_reward,
+                        )
 
-                    if self.reward_mode == "sparse":
-                        # Sparse: 本局結果寫入該局最後一步
-                        if agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
-                            if agent_won:
-                                trajectories[agent_pid][-1]["reward"] = 1.0
-                            elif agent_dealt_in:
-                                trajectories[agent_pid][-1]["reward"] = -1.0
-                    # dense 模式不做 per-round 的 reward 賦值（後續終局結算處理）
+                        if rt.is_game_over:
+                            final_scores_now = list(rt.final_score.tens)
+                            sorted_pids = sorted(
+                                range(4),
+                                key=lambda i: (final_scores_now[i], -i),
+                                reverse=True,
+                            )
+                            final_rank = sorted_pids.index(agent_pid) + 1
+                            game_reward = (
+                                self.reward_calculator.compute_game_end_reward(
+                                    final_rank, final_score
+                                )
+                            )
+                            self._add_reward_components(
+                                trajectories[agent_pid][-1],
+                                game=game_reward,
+                            )
 
                     hand_results.append({
                         "is_draw": is_draw,
                         "agent_won": agent_won,
                         "agent_deal_in": agent_dealt_in,
+                        "agent_riichi": agent_riichi,
+                        "agent_called": agent_called,
+                        "agent_tenpai": agent_tenpai,
+                        "tenpai_opportunity": exhaustive_draw,
                     })
                     total_hands += 1
+                    anyone_agari = anyone_agari or bool(wins_this_hand)
 
-                prev_shanten = None
+                last_agent_obs = None
+                hand_start_step = len(trajectories[agent_pid])
 
         # ── 終局結算 ──
-        try:
-            final_rewards = self.env.rewards()
-        except:
-            final_rewards = {f"player_{i}": 0 for i in range(4)}
-
         try:
             final_state_proto = self.env.state().to_proto()
             if (
@@ -335,47 +403,6 @@ class SelfPlayRunner:
             real_tens = [25000, 25000, 25000, 25000]
             final_state_proto = None
 
-        # ── dense 模式的終局回溯 reward ──
-        is_houjuu = False
-        if self.reward_mode == "dense" and agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
-            final_obs = None
-            if agent_key in obs_dict:
-                final_obs = obs_dict[agent_key]
-            else:
-                final_obs = trajectories[agent_pid][-1]["obs_raw"]
-
-            agent_score_delta = real_tens[agent_pid] - 25000
-
-            is_houjuu = self.reward_calculator.check_houjuu(final_obs)
-            if is_houjuu:
-                best_opponent_delta = (
-                    max(real_tens[i] for i in range(4) if i != agent_pid) - 25000
-                )
-                penalty = self.reward_calculator.calculate_penalty_reward(
-                    final_obs, best_opponent_delta
-                )
-                # 🆕 放大終局 penalty 權重 ×15（Dense: 終局信號主導，但不至於破壞 return 分佈）
-                trajectories[agent_pid][-1]["reward"] += penalty * 15.0
-
-            final_hand_info = self.reward_calculator.compute_winning_hand_info(final_obs)
-            if final_hand_info is not None and agent_score_delta > 0:
-                for step in trajectories[agent_pid]:
-                    current_hand_34 = self.reward_calculator._get_current_hand_34(
-                        step["obs_raw"]
-                    )
-                    r_back = self.reward_calculator.calculate_backward_reward(
-                        final_hand_info, agent_score_delta, current_hand_34
-                    )
-                    # 🆕 放大終局胡牌 backward reward ×15（Dense: 終局信號主導，但不至於破壞 return 分佈）
-                    step["reward"] += r_back * 15.0
-            elif agent_score_delta <= 0:
-                for step in trajectories[agent_pid]:
-                    # 🆕 未胡牌懲罰加強（-0.001 → -0.01）
-                    step["reward"] += -0.01
-        elif self.reward_mode == "sparse":
-            if hand_results:
-                is_houjuu = hand_results[-1].get("agent_deal_in", False)
-
         # 清理 obs_raw
         if agent_pid in trajectories:
             for step in trajectories[agent_pid]:
@@ -390,38 +417,23 @@ class SelfPlayRunner:
         )
         agent_rank = sorted_pids.index(agent_pid) + 1
 
-        # 🆕 Sparse: 用整場遊戲勝負覆蓋最後一步 reward
-        # 確保每場遊戲一定有非零的終局信號（agent_rank==1 → +1, agent_rank==4 → -1, 其他 → 0）
-        if self.reward_mode == "sparse" and agent_pid in trajectories and len(trajectories[agent_pid]) > 0:
-            if agent_rank == 1:
-                trajectories[agent_pid][-1]["reward"] = 1.0
-            elif agent_rank == 4:
-                trajectories[agent_pid][-1]["reward"] = -1.0
-            else:
-                trajectories[agent_pid][-1]["reward"] = 0.0
-
-        wins_pids = []
-        if (
-            final_state_proto is not None
-            and final_state_proto.HasField("round_terminal")
-            and len(final_state_proto.round_terminal.wins) > 0
-        ):
-            wins_pids = [w.who for w in final_state_proto.round_terminal.wins]
-
-        if final_state_proto is None and agent_has_won:
-            wins_pids = [agent_pid]
-
-        is_agari = agent_has_won or (agent_pid in wins_pids)
+        is_agari = any(
+            result.get("agent_won", False) for result in hand_results
+        )
+        is_houjuu = any(
+            result.get("agent_deal_in", False) for result in hand_results
+        )
 
         game_result = {
             "final_scores": final_scores,
             "agent_score": agent_score,
+            "point_delta": agent_score - 25000,
             "agent_rank": agent_rank,
             "agent_pid": agent_pid,
             "is_win": (agent_rank == 1),
             "is_agari": is_agari,
             "is_houjuu": is_houjuu,
-            "anyone_agari": (len(wins_pids) > 0),
+            "anyone_agari": anyone_agari,
             "hand_results": hand_results,
             "total_hands": total_hands,
         }
